@@ -92,7 +92,7 @@ def main():
             dpg.add_text("Minimum threshold for cross-correlation to trigger interferogram averaging")
 
         dpg.add_file_dialog(label="Select save file", directory_selector=False, show=False, callback= save_file_callback, tag="file_dialog", modal=True, width=2400, height=2000)
-        dpg.add_input_text(label="Save file", tag="save_file_input", width=600)
+        dpg.add_input_text(label="Save file", tag="save_file_input", width=1200)
         dpg.add_button(label="Browse", callback=lambda: dpg.show_item("file_dialog"))
         with dpg.tooltip("save_file_input"):
             dpg.add_text("File to save the averaged interferogram to")
