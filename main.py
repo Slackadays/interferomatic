@@ -1,8 +1,12 @@
 import dearpygui.dearpygui as dpg
 import playsound3
 from math import sin, cos
+import sys
+from pathlib import Path
 
-
+GAGE_API_DIR = Path(__file__).resolve().parent / "gage_api"
+if str(GAGE_API_DIR) not in sys.path:
+    sys.path.insert(0, str(GAGE_API_DIR))
 
 sindatax = []
 sindatay = []
@@ -22,6 +26,7 @@ def show_error_window(message):
 class ifmstate:
     gathering = False
     has_gage = False
+    save_file = ""
 
 ifm = ifmstate()
 
@@ -49,6 +54,16 @@ def button1_callback(sender, app_data):
         dpg.bind_item_theme("startstop_button", "stop_button_theme")
         dpg.set_item_label("startstop_button", "Stop")
 
+def save_file_callback(sender, app_data):
+    if isinstance(app_data, dict):
+        selected_file = app_data.get("file_path_name", "")
+    else:
+        selected_file = app_data
+
+    ifm.save_file = selected_file
+    dpg.set_value("save_file_input", selected_file)
+    print(f"Save file set to: {ifm.save_file}")
+
 def main():
 
 
@@ -75,6 +90,12 @@ def main():
         dpg.add_slider_float(label="Cross correlational threshold", tag="threshold_slider", default_value=0.5, max_value=1, width=600)
         with dpg.tooltip("threshold_slider"):
             dpg.add_text("Minimum threshold for cross-correlation to trigger interferogram averaging")
+
+        dpg.add_file_dialog(label="Select save file", directory_selector=False, show=False, callback= save_file_callback, tag="file_dialog", modal=True, width=2400, height=2000)
+        dpg.add_input_text(label="Save file", tag="save_file_input", width=600)
+        dpg.add_button(label="Browse", callback=lambda: dpg.show_item("file_dialog"))
+        with dpg.tooltip("save_file_input"):
+            dpg.add_text("File to save the averaged interferogram to")
 
         dpg.add_button(label="Fullscreen", tag="fullscreen_button", callback=lambda: dpg.toggle_viewport_fullscreen())
         dpg.add_button(label="Exit", callback=lambda: dpg.stop_dearpygui())
@@ -133,32 +154,6 @@ def run_gage():
     import PyGage
     import GageSupport as gs
     import GageConstants as gc
-    # 1. Init + open first system
-    status = PyGage.Initialize()
-    handle = PyGage.GetSystem(0, 0, 0, 0)
-    if handle < 0:
-        raise RuntimeError(PyGage.GetErrorString(handle))
-
-    # 2. Configure from INI (or set dicts yourself)
-    acq, _ = gs.LoadAcquisitionConfiguration(handle, "src/Acquire.ini")
-    PyGage.SetAcquisitionConfig(handle, acq)
-
-    chan, _ = gs.LoadChannelConfiguration(handle, 1, "src/Acquire.ini")
-    PyGage.SetChannelConfig(handle, 1, chan)
-
-    trig, _ = gs.LoadTriggerConfiguration(handle, 1, "src/Acquire.ini")
-    PyGage.SetTriggerConfig(handle, 1, trig)
-
-    status = PyGage.Commit(handle)
-    if status < 0:
-        raise RuntimeError(PyGage.GetErrorString(status))
-
-    # 3. Capture
-    PyGage.StartCapture(handle)
-    while PyGage.GetStatus(handle) != gc.ACQ_STATUS_READY:import PyGage
-    import GageSupport as gs
-    import GageConstants as gc
-
     # 1. Init + open first system
     status = PyGage.Initialize()
     handle = PyGage.GetSystem(0, 0, 0, 0)

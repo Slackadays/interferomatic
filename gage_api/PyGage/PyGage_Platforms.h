@@ -1,0 +1,193 @@
+#pragma once
+
+#ifdef _DEBUG
+#define _DEBUG_WAS_DEFINED 1
+#undef _DEBUG
+#endif
+
+#if PY_MAJOR_VERSION < 3
+#define PyInt_FromLong PyLong_FromLong
+#endif
+
+#if PY_MAJOR_VERSION >= 3
+	#if _WIN64
+		#define PyInit_PyGage PyInit_PyGage3_64
+		#define PyGage_Initialize PyGage3_64_Initialize
+		#define PyGage_GetSystem PyGage3_64_GetSystem
+		#define PyGage_FreeSystem PyGage3_64_FreeSystem
+		#define PyGage_GetSystemInfo PyGage3_64_GetSystemInfo
+		#define PyGage_GetBoardsInfo PyGage3_64_GetBoardsInfo
+		#define PyGage_GetAcquisitionConfig PyGage3_64_GetAcquisitionConfig
+		#define PyGage_SetAcquisitionConfig PyGage3_64_SetAcquisitionConfig
+		#define PyGage_GetChannlConfig PyGage3_64_GetChannelConfig
+		#define PyGage_SetChannelConfig PyGage3_64_SetChannelConfig
+		#define PyGage_GetTriggerConfig PyGage3_64_GetTriggerConfig
+		#define PyGage_SetTriggerConfig PyGage3_64_SetTriggerConfig
+		#define PyGage_Commit PyGage3_64_Commit
+		#define PyGage_ForceCapture PyGage3_64_FoceCapture
+		#define PyGage_AbortCapture PyGage3_64_AbortCapture
+		#define PyGage_GetStatus PyGage3_64_GetStatus
+		#define PyGage_TransferData PyGage3_64_TransferData
+		#define PyGage_GetStreamingBuffer PyGage3_64_GetStreamingBuffer
+		#define PyGage_FreeStreamingBuffer PyGage3_64_FreeStreamingBuffer
+		#define PyGage_TransferStreamingData PyGage3_64_TransferStreamingData
+		#define PyGage_StreamingTransferStatus PyGage3_64_StreamingTransferStatus
+		#define PyGage_ConvertToSigHeader PyGage3_64_ConvertToSigHeader
+		#define PyGage_ConvertFromSigHeader PyGage3_64_ConvertFromSigHeader
+		#define PyGage_GetErrorString PyGage3_64_GetErrorString
+		#define PyGage_GetSystemCaps PyGage3_64_GetSystemCaps
+		#define PyGage_SetDataPackingMode PyGage3_64_SetDataPackingMode
+		#define PyGage_SetStreamingCaptureMode PyGage3_64_SetStreamingCaptureMode
+		#define PyGage_SetFftConfig PyGage3_64_SetFftConfig
+		#define PyGage_PyGage_SetFftWindowConfig PyGage3_64_PyGage_SetFftWindowConfig
+		#define PyGage_SetMulRecAverageCount PyGage3_64_SetMulRecAverageCount
+		#define PyGage_SetIdentifyLed PyGage3_64_SetIdentifyLed
+		#define PyGage_SetOneSampleResolution PyGage3_64_SetOneSampleResolution
+		#define PyGage_GetExtendedBoardOptions PyGage3_64_GetExtendedBoardOptions
+		#define PyGage_GetStreamTotalDataSizeInBytes PyGage3_64_GetStreamTotalDataSizeInBytes
+		#define PyGage_GetStreamSegmentDataSizeInSamples PyGage3_64_GetStreamSegmentDataSizeInSamples
+		#define PyGage_PyGage_GetTimeStampFrequency PyGage3_64_PyGage_GetTimeStampFrequency
+		#define PyGage_GetDataPackingMode PyGage3_64_GetDataPackingMode
+		#define PyGage_GetCaptureMode PyGage3_64_GetCaptureMode
+		#define PyGage_GetDataFormatInfo PyGage3_64_GetDataFormatInfo
+		#define PyGage_GetTriggeredInfo PyGage3_64_GetTriggeredInfo
+		#define PyGage_GetFftConfig PyGage3_64_GetFftConfig
+		#define PyGage_GetSegmentTailSizeInBytes PyGage3_64_GetSegmentTailSizeInBytes
+		#define PyGage_GetMulRecAverageCount PyGage3_64_GetMulRecAverageCount
+	#else // 32 bit
+		#define PyInit_PyGage PyInit_PyGage3_32
+		#define PyGage_Initialize PyGage3_32_Initialize
+		#define PyGage_GetSystem PyGage3_32_GetSystem
+		#define PyGage_FreeSystem PyGage3_32_FreeSystem
+		#define PyGage_GetSystemInfo PyGage3_32_GetSystemInfo
+		#define PyGage_GetBoardsInfo PyGage3_32_GetBoardsInfo
+		#define PyGage_GetAcquisitionConfig PyGage3_32_GetAcquisitionConfig
+		#define PyGage_SetAcquisitionConfig PyGage3_32_SetAcquisitionConfig
+		#define PyGage_GetChannlConfig PyGage3_32_GetChannelConfig
+		#define PyGage_SetChannelConfig PyGage3_32_SetChannelConfig
+		#define PyGage_GetTriggerConfig PyGage3_32_GetTriggerConfig
+		#define PyGage_SetTriggerConfig PyGage3_32_SetTriggerConfig
+		#define PyGage_Commit PyGage3_32_Commit
+		#define PyGage_ForceCapture PyGage3_32_FoceCapture
+		#define PyGage_AbortCapture PyGage3_32_AbortCapture
+		#define PyGage_GetStatus PyGage3_32_GetStatus
+		#define PyGage_TransferData PyGage3_32_TransferData
+		#define PyGage_GetStreamingBuffer PyGage3_32_GetStreamingBuffer
+		#define PyGage_FreeStreamingBuffer PyGage3_32_FreeStreamingBuffer
+		#define PyGage_TransferStreamingData PyGage3_32_TransferStreamingData
+		#define PyGage_StreamingTransferStatus PyGage3_32_StreamingTransferStatus
+		#define PyGage_ConvertToSigHeader PyGage3_32_ConvertToSigHeader
+		#define PyGage_ConvertFromSigHeader PyGage3_32_ConvertFromSigHeader
+		#define PyGage_GetErrorString PyGage3_32_GetErrorString
+		#define PyGage_GetSystemCaps PyGage3_32_GetSystemCaps
+		#define PyGage_SetDataPackingMode PyGage3_32_SetDataPackingMode
+		#define PyGage_SetStreamingCaptureMode PyGage3_32_SetStreamingCaptureMode
+		#define PyGage_SetFftConfig PyGage3_32_SetFftConfig
+		#define PyGage_PyGage_SetFftWindowConfig PyGage3_32_PyGage_SetFftWindowConfig
+		#define PyGage_SetMulRecAverageCount PyGage3_32_SetMulRecAverageCount
+		#define PyGage_SetIdentifyLed PyGage3_32_SetIdentifyLed
+		#define PyGage_SetOneSampleResolution PyGage3_32_SetOneSampleResolution
+		#define PyGage_GetExtendedBoardOptions PyGage3_32_GetExtendedBoardOptions
+		#define PyGage_GetStreamTotalDataSizeInBytes PyGage3_32_GetStreamTotalDataSizeInBytes
+		#define PyGage_GetStreamSegmentDataSizeInSamples PyGage3_32_GetStreamSegmentDataSizeInSamples
+		#define PyGage_PyGage_GetTimeStampFrequency PyGage3_32_PyGage_GetTimeStampFrequency
+		#define PyGage_GetDataPackingMode PyGage3_32_GetDataPackingMode
+		#define PyGage_GetCaptureMode PyGage3_32_GetCaptureMode
+		#define PyGage_GetDataFormatInfo PyGage3_32_GetDataFormatInfo
+		#define PyGage_GetTriggeredInfo PyGage3_32_GetTriggeredInfo
+		#define PyGage_GetFftConfig PyGage3_32_GetFftConfig
+		#define PyGage_GetSegmentTailSizeInBytes PyGage3_32_GetSegmentTailSizeInBytes
+		#define PyGage_GetMulRecAverageCount PyGage3_32_GetMulRecAverageCount
+	#endif 
+#else
+	#if _WIN64
+		#define initPyGage initPyGage2_64
+		#define PyGage_Initialize PyGage2_64_Initialize
+		#define PyGage_GetSystem PyGage2_64_GetSystem
+		#define PyGage_FreeSystem PyGage2_64_FreeSystem
+		#define PyGage_GetSystemInfo PyGage2_64_GetSystemInfo
+		#define PyGage_GetBoardsInfo PyGage2_64_GetBoardsInfo
+		#define PyGage_GetAcquisitionConfig PyGage2_64_GetAcquisitionConfig
+		#define PyGage_SetAcquisitionConfig PyGage2_64_SetAcquisitionConfig
+		#define PyGage_GetChannlConfig PyGage2_64_GetChannelConfig
+		#define PyGage_SetChannelConfig PyGage2_64_SetChannelConfig
+		#define PyGage_GetTriggerConfig PyGage2_64_GetTriggerConfig
+		#define PyGage_SetTriggerConfig PyGage2_64_SetTriggerConfig
+		#define PyGage_Commit PyGage2_64_Commit
+		#define PyGage_ForceCapture PyGage2_64_FoceCapture
+		#define PyGage_AbortCapture PyGage2_64_AbortCapture
+		#define PyGage_GetStatus PyGage2_64_GetStatus
+		#define PyGage_TransferData PyGage2_64_TransferData
+		#define PyGage_GetStreamingBuffer PyGage2_64_GetStreamingBuffer
+		#define PyGage_FreeStreamingBuffer PyGage2_64_FreeStreamingBuffer
+		#define PyGage_TransferStreamingData PyGage2_64_TransferStreamingData
+		#define PyGage_StreamingTransferStatus PyGage2_64_StreamingTransferStatus
+		#define PyGage_ConvertToSigHeader PyGage2_64_ConvertToSigHeader
+		#define PyGage_ConvertFromSigHeader PyGage2_64_ConvertFromSigHeader
+		#define PyGage_GetErrorString PyGage2_64_GetErrorString
+		#define PyGage_GetSystemCaps PyGage2_64_GetSystemCaps
+		#define PyGage_SetDataPackingMode PyGage2_64_SetDataPackingMode
+		#define PyGage_SetStreamingCaptureMode PyGage2_64_SetStreamingCaptureMode
+		#define PyGage_SetFftConfig PyGage2_64_SetFftConfig
+		#define PyGage_PyGage_SetFftWindowConfig PyGage2_64_PyGage_SetFftWindowConfig
+		#define PyGage_SetMulRecAverageCount PyGage2_64_SetMulRecAverageCount
+		#define PyGage_SetIdentifyLed PyGage2_64_SetIdentifyLed
+		#define PyGage_SetOneSampleResolution PyGage2_64_SetOneSampleResolution
+		#define PyGage_GetExtendedBoardOptions PyGage2_64_GetExtendedBoardOptions
+		#define PyGage_GetStreamTotalDataSizeInBytes PyGage2_64_GetStreamTotalDataSizeInBytes
+		#define PyGage_GetStreamSegmentDataSizeInSamples PyGage2_64_GetStreamSegmentDataSizeInSamples
+		#define PyGage_PyGage_GetTimeStampFrequency PyGage2_64_PyGage_GetTimeStampFrequency
+		#define PyGage_GetDataPackingMode PyGage2_64_GetDataPackingMode
+		#define PyGage_GetCaptureMode PyGage2_64_GetCaptureMode
+		#define PyGage_GetDataFormatInfo PyGage2_64_GetDataFormatInfo
+		#define PyGage_GetTriggeredInfo PyGage2_64_GetTriggeredInfo
+		#define PyGage_GetFftConfig PyGage2_64_GetFftConfig
+		#define PyGage_GetSegmentTailSizeInBytes PyGage_64_GetSegmentTailSizeInBytes
+		#define PyGage_GetMulRecAverageCount PyGage2_64_GetMulRecAverageCount
+	#else 
+		#define initPyGage initPyGage2_32
+		#define PyGage_Initialize PyGage2_32_Initialize
+		#define PyGage_GetSystem PyGage2_32_GetSystem
+		#define PyGage_FreeSystem PyGage2_32_FreeSystem
+		#define PyGage_GetSystemInfo PyGage2_32_GetSystemInfo
+		#define PyGage_GetBoardsInfo PyGage2_32_GetBoardsInfo
+		#define PyGage_GetAcquisitionConfig PyGage2_32_GetAcquisitionConfig
+		#define PyGage_SetAcquisitionConfig PyGage2_32_SetAcquisitionConfig
+		#define PyGage_GetChannlConfig PyGage2_32_GetChannelConfig
+		#define PyGage_SetChannelConfig PyGage2_32_SetChannelConfig
+		#define PyGage_GetTriggerConfig PyGage2_32_GetTriggerConfig
+		#define PyGage_SetTriggerConfig PyGage2_32_SetTriggerConfig
+		#define PyGage_Commit PyGage2_32_Commit
+		#define PyGage_ForceCapture PyGage2_32_FoceCapture
+		#define PyGage_AbortCapture PyGage2_32_AbortCapture
+		#define PyGage_GetStatus PyGage2_32_GetStatus
+		#define PyGage_TransferData PyGage2_32_TransferData
+		#define PyGage_GetStreamingBuffer PyGage2_32_GetStreamingBuffer
+		#define PyGage_FreeStreamingBuffer PyGage2_32_FreeStreamingBuffer
+		#define PyGage_TransferStreamingData PyGage2_32_TransferStreamingData
+		#define PyGage_StreamingTransferStatus PyGage2_32_StreamingTransferStatus
+		#define PyGage_ConvertToSigHeader PyGage2_32_ConvertToSigHeader
+		#define PyGage_ConvertFromSigHeader PyGage2_32_ConvertFromSigHeader
+		#define PyGage_GetErrorString PyGage2_32_GetErrorString
+		#define PyGage_GetSystemCaps PyGage2_32_GetSystemCaps
+		#define PyGage_SetDataPackingMode PyGage2_32_SetDataPackingMode
+		#define PyGage_SetStreamingCaptureMode PyGage2_32_SetStreamingCaptureMode
+		#define PyGage_SetFftConfig PyGage2_32_SetFftConfig
+		#define PyGage_PyGage_SetFftWindowConfig PyGage2_32_PyGage_SetFftWindowConfig
+		#define PyGage_SetMulRecAverageCount PyGage2_32_SetMulRecAverageCount
+		#define PyGage_SetIdentifyLed PyGage2_32_SetIdentifyLed
+		#define PyGage_SetOneSampleResolution PyGage2_32_SetOneSampleResolution
+		#define PyGage_GetExtendedBoardOptions PyGage2_32_GetExtendedBoardOptions
+		#define PyGage_GetStreamTotalDataSizeInBytes PyGage2_32_GetStreamTotalDataSizeInBytes
+		#define PyGage_GetStreamSegmentDataSizeInSamples PyGage2_32_GetStreamSegmentDataSizeInSamples
+		#define PyGage_PyGage_GetTimeStampFrequency PyGage2_32_PyGage_GetTimeStampFrequency
+		#define PyGage_GetDataPackingMode PyGage2_32_GetDataPackingMode
+		#define PyGage_GetCaptureMode PyGage2_32_GetCaptureMode
+		#define PyGage_GetDataFormatInfo PyGage2_32_GetDataFormatInfo
+		#define PyGage_GetTriggeredInfo PyGage2_32_GetTriggeredInfo
+		#define PyGage_GetFftConfig PyGage2_32_GetFftConfig
+		#define PyGage_GetSegmentTailSizeInBytes PyGage2_32_GetSegmentTailSizeInBytes
+		#define PyGage_GetMulRecAverageCount PyGage2_32_GetMulRecAverageCount
+	#endif
+#endif
+
