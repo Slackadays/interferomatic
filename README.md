@@ -4,10 +4,17 @@ Collect interferograms and generate a transmission spectrum through frequency co
 
 ## Requirements
 
-- A GaGe data acquisition card (we use the Razor)
+- A Gage data acquisition card (we use the Razor)
 - Python
 - numpy
 - python-dev
-- GaGe Linux driver
+- Gage Linux driver
 
-## Installatioj
+## Installation
+
+First build the Gage Linux driver, then build the Python API with
+
+```
+cd gage-linux-driver/Sdk/Python/PyGage
+python3 setup.py install
+```
