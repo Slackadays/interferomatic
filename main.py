@@ -1,5 +1,5 @@
 import dearpygui.dearpygui as dpg
-import playsound
+import playsound3
 
 class ifmstate:
     gathering = False
@@ -9,7 +9,7 @@ ifm = ifmstate()
 
 def button1_callback(sender, app_data):
     print("Button 1 clicked")
-    playsound.playsound("knopka-iz-igry-2.mp3", block=False)
+    playsound3.playsound("src/knopka-iz-igry-2.mp3", block=False)
     if ifm.gathering:
         print("Stopping data gathering...")
         ifm.gathering = False
@@ -39,8 +39,8 @@ def main():
     dpg.create_viewport(title="Interferomatic", width=800, height=600)
 
     with dpg.font_registry():
-        default_font = dpg.add_font("ScienceGothic-Medium.ttf", 40)
-        giant_font = dpg.add_font("ScienceGothic-Medium.ttf", 80)
+        default_font = dpg.add_font("src/ScienceGothic-Medium.ttf", 40)
+        giant_font = dpg.add_font("src/ScienceGothic-Medium.ttf", 80)
     
     dpg.bind_font(default_font)
 
@@ -89,13 +89,13 @@ def main():
         raise RuntimeError(PyGage.GetErrorString(handle))
 
     # 2. Configure from INI (or set dicts yourself)
-    acq, _ = gs.LoadAcquisitionConfiguration(handle, "Acquire.ini")
+    acq, _ = gs.LoadAcquisitionConfiguration(handle, "src/Acquire.ini")
     PyGage.SetAcquisitionConfig(handle, acq)
 
-    chan, _ = gs.LoadChannelConfiguration(handle, 1, "Acquire.ini")
+    chan, _ = gs.LoadChannelConfiguration(handle, 1, "src/Acquire.ini")
     PyGage.SetChannelConfig(handle, 1, chan)
 
-    trig, _ = gs.LoadTriggerConfiguration(handle, 1, "Acquire.ini")
+    trig, _ = gs.LoadTriggerConfiguration(handle, 1, "src/Acquire.ini")
     PyGage.SetTriggerConfig(handle, 1, trig)
 
     status = PyGage.Commit(handle)
@@ -115,13 +115,13 @@ def main():
         raise RuntimeError(PyGage.GetErrorString(handle))
 
     # 2. Configure from INI (or set dicts yourself)
-    acq, _ = gs.LoadAcquisitionConfiguration(handle, "Acquire.ini")
+    acq, _ = gs.LoadAcquisitionConfiguration(handle, "src/Acquire.ini")
     PyGage.SetAcquisitionConfig(handle, acq)
 
-    chan, _ = gs.LoadChannelConfiguration(handle, 1, "Acquire.ini")
+    chan, _ = gs.LoadChannelConfiguration(handle, 1, "src/Acquire.ini")
     PyGage.SetChannelConfig(handle, 1, chan)
 
-    trig, _ = gs.LoadTriggerConfiguration(handle, 1, "Acquire.ini")
+    trig, _ = gs.LoadTriggerConfiguration(handle, 1, "src/Acquire.ini")
     PyGage.SetTriggerConfig(handle, 1, trig)
 
     status = PyGage.Commit(handle)
