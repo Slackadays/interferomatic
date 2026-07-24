@@ -73,7 +73,7 @@ def show_scale_chooser(default_scale=DEFAULT_FONT_SCALE, on_done=None):
         no_close=True,
         no_collapse=True,
         width=1200,
-        height=1000,
+        height=800,
         pos=(80, 80),
     ):
         dpg.add_text("Choose a UI scale that looks good on this display.")

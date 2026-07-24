@@ -101,7 +101,6 @@ def save_file_callback(sender, app_data):
     print(f"Save file set to: {ifm.save_file}")
 
 def main():
-    # Setup Dear PyGUI
     dpg.create_context()
     dpg.create_viewport(title="Interferomatic")
 
@@ -114,13 +113,10 @@ def main():
 
     dpg.setup_dearpygui()
 
-
     dpg.show_style_editor()
-
 
     dpg.show_viewport()
 
-    # Ask for (or load) a font scale before building the main UI so sizing is correct.
     font_scale = resolve_font_scale()
     dpg.set_global_font_scale(font_scale)
     print(f"Using font scale: {font_scale:.2f}")
@@ -156,7 +152,7 @@ def main():
         with dpg.tooltip("threshold_slider"):
             dpg.add_text("Minimum threshold for cross-correlation to trigger interferogram averaging")
 
-        dpg.add_file_dialog(label="Select save file", directory_selector=False, show=False, callback= save_file_callback, tag="file_dialog", modal=True, width=2400, height=2000)
+        dpg.add_file_dialog(label="Select save file", directory_selector=False, show=False, callback= save_file_callback, tag="file_dialog", modal=True, width=2000, height=1000)
         dpg.add_input_text(
             label="Save file",
             tag="save_file_input",
