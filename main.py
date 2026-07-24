@@ -3,8 +3,9 @@ import playsound3
 from math import sin, cos
 import sys
 from pathlib import Path
+from enum import Enum
 
-from src.config import save_config, load_ui_settings
+from src.config import save_config, load_ui_settings, BULK_UNITS
 from src.scaling import resolve_font_scale, change_font_scale
 
 GAGE_API_DIR = Path(__file__).resolve().parent / "gage_api"
@@ -26,10 +27,25 @@ def show_error_window(message):
     while dpg.does_item_exist("error_window"):
         dpg.render_dearpygui_frame()
 
+class Mode(Enum):
+    MONITOR = 1
+    COLLECT = 2
+    AVERAGE = 3
+
+
+MODE_LABELS = {
+    Mode.MONITOR: "Monitor signal",
+    Mode.COLLECT: "Collect bulk data",
+    Mode.AVERAGE: "Average interferograms",
+}
+LABEL_TO_MODE = {label: mode for mode, label in MODE_LABELS.items()}
+
+
 class ifmstate:
     gathering = False
     has_gage = False
     save_file = ""
+    mode = Mode.MONITOR
 
 ifm = ifmstate()
 
@@ -42,18 +58,67 @@ except ImportError:
     print("Running in Gage-less mode. PyGage module not found.")
 
 
+# Acquisition settings locked while gathering. Start/Stop, Fullscreen,
+# Change Scale, Exit, and the live plot stay usable.
+SETTINGS_WIDGETS = (
+    "mode_combo",
+    "interferograms_input",
+    "bulk_limit_input",
+    "bulk_unit_combo",
+    "threshold_slider",
+    "save_file_input",
+    "browse_button",
+)
+
+
+def update_mode_dependent_widgets():
+    """Show only the limit controls that apply to the current mode."""
+    if not dpg.does_item_exist("average_controls"):
+        return
+    show_average = ifm.mode == Mode.AVERAGE
+    show_bulk = ifm.mode == Mode.COLLECT
+    dpg.configure_item("average_controls", show=show_average)
+    dpg.configure_item("bulk_controls", show=show_bulk)
+
+
+def set_settings_enabled(enabled: bool):
+    """Enable or gray out acquisition settings (not screen controls)."""
+    for tag in SETTINGS_WIDGETS:
+        if not dpg.does_item_exist(tag):
+            continue
+        if enabled:
+            dpg.enable_item(tag)
+        else:
+            dpg.disable_item(tag)
+
+
 def save_ui_settings_from_widgets():
     """Snapshot current main-window field values into config.json."""
-    data = {}
+    data = {"mode": ifm.mode.name}
     if dpg.does_item_exist("interferograms_input"):
         data["interferograms"] = int(dpg.get_value("interferograms_input"))
+    if dpg.does_item_exist("bulk_limit_input"):
+        data["bulk_limit"] = int(dpg.get_value("bulk_limit_input"))
+    if dpg.does_item_exist("bulk_unit_combo"):
+        data["bulk_unit"] = dpg.get_value("bulk_unit_combo")
     if dpg.does_item_exist("threshold_slider"):
         data["threshold"] = float(dpg.get_value("threshold_slider"))
     if dpg.does_item_exist("save_file_input"):
         data["save_file"] = dpg.get_value("save_file_input") or ""
         ifm.save_file = data["save_file"]
-    if data:
-        save_config(data, quiet=True)
+    save_config(data, quiet=True)
+
+def mode_callback(sender, app_data):
+    mode = LABEL_TO_MODE.get(app_data)
+    if mode is None:
+        print(f"Unknown mode selected: {app_data}")
+        return
+
+    ifm.mode = mode
+    update_mode_dependent_widgets()
+    save_config({"mode": ifm.mode.name}, quiet=True)
+    print(f"Mode set to: {ifm.mode.name}")
+
 
 def button1_callback(sender, app_data):
     print("Button 1 clicked")
@@ -64,12 +129,14 @@ def button1_callback(sender, app_data):
         # set the button color back to green
         dpg.bind_item_theme("startstop_button", "start_button_theme")
         dpg.set_item_label("startstop_button", "Start")
+        set_settings_enabled(True)
     else:
         print("Starting data gathering...")
         ifm.gathering = True
         # set the button color to red
         dpg.bind_item_theme("startstop_button", "stop_button_theme")
         dpg.set_item_label("startstop_button", "Stop")
+        set_settings_enabled(False)
 
 def interferograms_callback(sender, app_data):
     try:
@@ -77,6 +144,19 @@ def interferograms_callback(sender, app_data):
     except (TypeError, ValueError):
         return
     save_config({"interferograms": value}, quiet=True)
+
+def bulk_limit_callback(sender, app_data):
+    try:
+        value = int(app_data)
+    except (TypeError, ValueError):
+        return
+    save_config({"bulk_limit": value}, quiet=True)
+
+def bulk_unit_callback(sender, app_data):
+    if app_data not in BULK_UNITS:
+        print(f"Unknown bulk unit selected: {app_data}")
+        return
+    save_config({"bulk_unit": app_data}, quiet=True)
 
 def threshold_callback(sender, app_data):
     try:
@@ -123,23 +203,56 @@ def main():
 
     ui = load_ui_settings()
     ifm.save_file = ui["save_file"]
+    ifm.mode = Mode[ui["mode"]]
     print(
-        f"Loaded UI settings: interferograms={ui['interferograms']}, "
+        f"Loaded UI settings: mode={ui['mode']}, interferograms={ui['interferograms']}, "
+        f"bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
         f"threshold={ui['threshold']}, save_file={ui['save_file']!r}"
     )
 
     with dpg.window(label="Main Window", tag="main_window"):
         dpg.add_button(label="Start", tag="startstop_button", callback=button1_callback)
 
-        dpg.add_input_int(
-            label="Interferograms to collect",
-            tag="interferograms_input",
-            default_value=ui["interferograms"],
-            width=600,
-            callback=interferograms_callback,
+        dpg.add_combo(
+            items=list(MODE_LABELS.values()),
+            label="Choose mode",
+            tag="mode_combo",
+            callback=mode_callback,
+            default_value=MODE_LABELS[ifm.mode],
+            width=600
         )
-        with dpg.tooltip("interferograms_input"):
-            dpg.add_text("Number of interferograms to collect before stopping")
+
+        with dpg.group(tag="average_controls", show=ifm.mode == Mode.AVERAGE):
+            dpg.add_input_int(
+                label="Interferograms to average",
+                tag="interferograms_input",
+                default_value=ui["interferograms"],
+                width=600,
+                callback=interferograms_callback,
+            )
+            with dpg.tooltip("interferograms_input"):
+                dpg.add_text("Number of interferograms to collect and average before stopping")
+
+        with dpg.group(tag="bulk_controls", show=ifm.mode == Mode.COLLECT):
+            with dpg.group(horizontal=True):
+                dpg.add_input_int(
+                    label="Collect until",
+                    tag="bulk_limit_input",
+                    default_value=ui["bulk_limit"],
+                    width=400,
+                    callback=bulk_limit_callback,
+                )
+                dpg.add_combo(
+                    items=list(BULK_UNITS),
+                    tag="bulk_unit_combo",
+                    default_value=ui["bulk_unit"],
+                    width=200,
+                    callback=bulk_unit_callback,
+                )
+            with dpg.tooltip("bulk_limit_input"):
+                dpg.add_text("Stop bulk collection after this amount of data or time")
+            with dpg.tooltip("bulk_unit_combo"):
+                dpg.add_text("Unit for the collection limit: data size (MB, GB) or duration (seconds, minutes)")
 
         dpg.add_slider_float(
             label="Cross correlational threshold",
@@ -160,7 +273,11 @@ def main():
             width=1200,
             callback=save_file_text_callback,
         )
-        dpg.add_button(label="Browse", callback=lambda: dpg.show_item("file_dialog"))
+        dpg.add_button(
+            label="Browse",
+            tag="browse_button",
+            callback=lambda: dpg.show_item("file_dialog"),
+        )
         with dpg.tooltip("save_file_input"):
             dpg.add_text("File to save the averaged interferogram to")
 
@@ -168,7 +285,7 @@ def main():
 
         dpg.add_button(label="Change Scale", tag="scale_button", callback=lambda: change_font_scale())
 
-        dpg.add_button(label="Exit", callback=lambda: dpg.stop_dearpygui())
+        dpg.add_button(label="Exit", tag="exit_button", callback=lambda: dpg.stop_dearpygui())
 
         with dpg.plot(label="Live View", tag="chart1", height=800, width=1600):
             dpg.add_plot_legend()

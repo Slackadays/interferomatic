@@ -9,6 +9,11 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 DEFAULT_INTERFEROGRAMS = 100000
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_SAVE_FILE = ""
+DEFAULT_MODE = "MONITOR"
+DEFAULT_BULK_LIMIT = 1
+DEFAULT_BULK_UNIT = "GB"
+BULK_UNITS = ("MB", "GB", "seconds", "minutes")
+VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE")
 
 
 def load_config():
@@ -39,25 +44,33 @@ def save_config(data, quiet=False):
         print(f"Warning: could not write {CONFIG_PATH}: {e}")
 
 
+def _parse_positive_int(value, default):
+    """Parse a positive integer from config; fall back to *default* if invalid."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float) and value == int(value):
+        parsed = int(value)
+    else:
+        return default
+    if parsed < 1:
+        return default
+    return parsed
+
+
 def load_ui_settings():
     """
     Load persisted UI field values from config.json.
-    Returns a dict with keys: interferograms, threshold, save_file.
+    Returns a dict with keys: interferograms, threshold, save_file, mode,
+    bulk_limit, bulk_unit.
     """
     config = load_config()
 
-    interferograms = config.get("interferograms", DEFAULT_INTERFEROGRAMS)
-    # bool is a subclass of int; reject it. Accept whole-number floats from JSON.
-    if isinstance(interferograms, bool):
-        interferograms = DEFAULT_INTERFEROGRAMS
-    elif isinstance(interferograms, int):
-        pass
-    elif isinstance(interferograms, float) and interferograms == int(interferograms):
-        interferograms = int(interferograms)
-    else:
-        interferograms = DEFAULT_INTERFEROGRAMS
-    if interferograms < 1:
-        interferograms = DEFAULT_INTERFEROGRAMS
+    interferograms = _parse_positive_int(
+        config.get("interferograms", DEFAULT_INTERFEROGRAMS),
+        DEFAULT_INTERFEROGRAMS,
+    )
 
     threshold = config.get("threshold", DEFAULT_THRESHOLD)
     if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
@@ -71,8 +84,24 @@ def load_ui_settings():
     if not isinstance(save_file, str):
         save_file = DEFAULT_SAVE_FILE
 
+    mode = config.get("mode", DEFAULT_MODE)
+    if mode not in VALID_MODES:
+        mode = DEFAULT_MODE
+
+    bulk_limit = _parse_positive_int(
+        config.get("bulk_limit", DEFAULT_BULK_LIMIT),
+        DEFAULT_BULK_LIMIT,
+    )
+
+    bulk_unit = config.get("bulk_unit", DEFAULT_BULK_UNIT)
+    if bulk_unit not in BULK_UNITS:
+        bulk_unit = DEFAULT_BULK_UNIT
+
     return {
         "interferograms": interferograms,
         "threshold": threshold,
         "save_file": save_file,
+        "mode": mode,
+        "bulk_limit": bulk_limit,
+        "bulk_unit": bulk_unit,
     }
