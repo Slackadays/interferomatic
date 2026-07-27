@@ -78,6 +78,28 @@ SAMPLERATE_LABELS = {
 LABEL_TO_SAMPLERATE = {label: rate for rate, label in SAMPLERATE_LABELS.items()}
 DEFAULT_SAMPLERATE_LABEL = SAMPLERATE_LABELS[200_000_000]
 
+# Gage InputRange is millivolts peak-to-peak (bipolar label shows half of that).
+# Keys match the values written to channel['InputRange'] / Acquire.ini Range=.
+INPUT_RANGE_LABELS = {
+    200: "±100mV",
+    400: "±200mV",
+    1000: "±500mV",
+    2000: "±1V",
+    4000: "±2V",
+    10000: "±5V",
+}
+LABEL_TO_INPUT_RANGE = {label: mv for mv, label in INPUT_RANGE_LABELS.items()}
+DEFAULT_INPUT_RANGE_LABEL = INPUT_RANGE_LABELS[2000]
+# Preserve the order from the UI dropdown.
+INPUT_RANGE_COMBO_ITEMS = [
+    "±100mV",
+    "±200mV",
+    "±500mV",
+    "±1V",
+    "±2V",
+    "±5V",
+]
+
 
 def parse_samplerate_label(label):
     """Convert a sample-rate combo label (e.g. '200 MS/s') to an int S/s."""
@@ -95,12 +117,27 @@ def samplerate_to_label(rate):
     return SAMPLERATE_LABELS.get(rate, DEFAULT_SAMPLERATE_LABEL)
 
 
+def parse_input_range_label(label):
+    """Convert an input-range combo label (e.g. '±1V') to mV peak-to-peak."""
+    if not isinstance(label, str):
+        raise ValueError(f"Invalid input range label: {label!r}")
+    if label in LABEL_TO_INPUT_RANGE:
+        return LABEL_TO_INPUT_RANGE[label]
+    raise ValueError(f"Unknown input range label: {label!r}")
+
+
+def input_range_to_label(range_mv):
+    """Convert Gage InputRange (mV peak-to-peak) to a combo label."""
+    return INPUT_RANGE_LABELS.get(range_mv, DEFAULT_INPUT_RANGE_LABEL)
+
+
 class ifmstate:
     gathering = False
     has_gage = False
     save_file = ""
     mode = Mode.MONITOR
     samplerate = 200000000
+    input_range = 2000  # mV peak-to-peak (±1 V)
     channel1 = True
     channel2 = False
     channel3 = False
@@ -142,6 +179,7 @@ SETTINGS_WIDGETS = (
     "channel2_checkbox",
     "channel3_checkbox",
     "channel4_checkbox",
+    "input_range_dropdown",
 )
 
 
@@ -239,7 +277,7 @@ def live_view_tick():
         return
 
     try:
-        engine.configure(ifm.samplerate, channels)
+        engine.configure(ifm.samplerate, channels, ifm.input_range)
         data = engine.capture(channels)
         apply_live_view_data(data)
         ifm.live_error = None
@@ -277,6 +315,12 @@ def save_ui_settings_from_widgets():
             ifm.samplerate = data["samplerate"]
         except (TypeError, ValueError):
             print(f"Invalid sample rate selected: {dpg.get_value('sample_rate_dropdown')}")
+    if dpg.does_item_exist("input_range_dropdown"):
+        try:
+            data["input_range"] = parse_input_range_label(dpg.get_value("input_range_dropdown"))
+            ifm.input_range = data["input_range"]
+        except (TypeError, ValueError):
+            print(f"Invalid input range selected: {dpg.get_value('input_range_dropdown')}")
     if dpg.does_item_exist("channel1_checkbox"):
         data["channel1"] = bool(dpg.get_value("channel1_checkbox"))
         ifm.channel1 = data["channel1"]
@@ -316,6 +360,17 @@ def samplerate_callback(sender, app_data):
     ifm.samplerate = value
     save_config({"samplerate": ifm.samplerate}, quiet=True)
     print(f"Sample rate set to: {ifm.samplerate} S/s")
+
+def input_range_callback(sender, app_data):
+    try:
+        value = parse_input_range_label(app_data)
+    except (TypeError, ValueError):
+        print(f"Invalid input range selected: {app_data}")
+        return
+
+    ifm.input_range = value
+    save_config({"input_range": ifm.input_range}, quiet=True)
+    print(f"Input range set to: {input_range_to_label(ifm.input_range)} ({ifm.input_range} mV pk-pk)")
 
 def channel_callback(sender, app_data, user_data):
     channel_number = user_data
@@ -363,11 +418,12 @@ def button1_callback(sender, app_data):
             show_error_window("Live View engine is not available.")
             return
         print(
-            f"Starting Live View: rate={ifm.samplerate} S/s, channels={channels}"
+            f"Starting Live View: rate={ifm.samplerate} S/s, "
+            f"range={input_range_to_label(ifm.input_range)}, channels={channels}"
             + ("" if ifm.has_gage else " (simulated)")
         )
         try:
-            ifm.live_engine.configure(ifm.samplerate, channels)
+            ifm.live_engine.configure(ifm.samplerate, channels, ifm.input_range)
         except Exception as e:
             show_error_window(f"Failed to configure Live View: {e}")
             return
@@ -449,12 +505,14 @@ def main():
     ifm.save_file = ui["save_file"]
     ifm.mode = Mode[ui["mode"]]
     ifm.samplerate = ui["samplerate"]
+    ifm.input_range = ui["input_range"]
     ifm.channel1 = ui["channel1"]
     ifm.channel2 = ui["channel2"]
     ifm.channel3 = ui["channel3"]
     ifm.channel4 = ui["channel4"]
     print(
         f"Loaded UI settings: mode={ui['mode']}, samplerate={ui['samplerate']}, "
+        f"input_range={input_range_to_label(ui['input_range'])}, "
         f"channels=[{ui['channel1']}, {ui['channel2']}, {ui['channel3']}, {ui['channel4']}], "
         f"interferograms={ui['interferograms']}, bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
         f"threshold={ui['threshold']}, save_file={ui['save_file']!r}"
@@ -528,6 +586,17 @@ def main():
         dpg.add_checkbox(label="Channel 2", tag="channel2_checkbox", default_value=ifm.channel2, callback=channel_callback, user_data=2)
         dpg.add_checkbox(label="Channel 3", tag="channel3_checkbox", default_value=ifm.channel3, callback=channel_callback, user_data=3)
         dpg.add_checkbox(label="Channel 4", tag="channel4_checkbox", default_value=ifm.channel4, callback=channel_callback, user_data=4)
+
+        dpg.add_combo(
+            tag="input_range_dropdown",
+            label="Input Range",
+            items=INPUT_RANGE_COMBO_ITEMS,
+            default_value=input_range_to_label(ifm.input_range),
+            width=600,
+            callback=input_range_callback,
+        )
+        with dpg.tooltip("input_range_dropdown"):
+            dpg.add_text("Full-scale input range for all active channels (Gage InputRange, peak-to-peak)")
 
         dpg.add_slider_float(
             label="Cross correlational threshold",

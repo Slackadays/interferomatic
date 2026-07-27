@@ -11,6 +11,8 @@ DEFAULT_THRESHOLD = 0.5
 DEFAULT_SAVE_FILE = ""
 DEFAULT_MODE = "MONITOR"
 DEFAULT_SAMPLERATE = 200000000
+# Gage InputRange is millivolts peak-to-peak (e.g. 2000 = ±1 V).
+DEFAULT_INPUT_RANGE = 2000
 DEFAULT_BULK_LIMIT = 1
 DEFAULT_BULK_UNIT = "GB"
 DEFAULT_CHANNEL1 = True
@@ -19,6 +21,8 @@ DEFAULT_CHANNEL3 = False
 DEFAULT_CHANNEL4 = False
 BULK_UNITS = ("MB", "GB", "seconds", "minutes")
 VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE")
+# Allowed InputRange values (mV peak-to-peak), matching the UI dropdown.
+VALID_INPUT_RANGES = (200, 400, 1000, 2000, 4000, 10000)
 
 
 def load_config():
@@ -68,7 +72,7 @@ def load_ui_settings():
     """
     Load persisted UI field values from config.json.
     Returns a dict with keys: interferograms, threshold, save_file, mode,
-    samplerate, bulk_limit, bulk_unit, channel1–channel4.
+    samplerate, input_range, bulk_limit, bulk_unit, channel1–channel4.
     """
     config = load_config()
 
@@ -97,6 +101,13 @@ def load_ui_settings():
         config.get("samplerate", DEFAULT_SAMPLERATE),
         DEFAULT_SAMPLERATE,
     )
+
+    input_range = _parse_positive_int(
+        config.get("input_range", DEFAULT_INPUT_RANGE),
+        DEFAULT_INPUT_RANGE,
+    )
+    if input_range not in VALID_INPUT_RANGES:
+        input_range = DEFAULT_INPUT_RANGE
 
     channel1 = config.get("channel1", DEFAULT_CHANNEL1)
     if not isinstance(channel1, bool):
@@ -129,6 +140,7 @@ def load_ui_settings():
         "save_file": save_file,
         "mode": mode,
         "samplerate": samplerate,
+        "input_range": input_range,
         "bulk_limit": bulk_limit,
         "bulk_unit": bulk_unit,
         "channel1": channel1,

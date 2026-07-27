@@ -91,6 +91,7 @@ class LiveViewEngine:
         self.app_config: Optional[dict] = None
         self._configured_rate: Optional[int] = None
         self._configured_channels: Optional[Tuple[int, ...]] = None
+        self._configured_input_range: Optional[int] = None
         self._active_channels: List[int] = [1]
         self._available = False
 
@@ -146,9 +147,19 @@ class LiveViewEngine:
             self._available = False
             self._configured_rate = None
             self._configured_channels = None
+            self._configured_input_range = None
 
-    def configure(self, sample_rate: int, enabled_channels: Sequence[int]) -> None:
-        """Load INI defaults, apply UI sample rate / channel mode, and Commit."""
+    def configure(
+        self,
+        sample_rate: int,
+        enabled_channels: Sequence[int],
+        input_range: int = 2000,
+    ) -> None:
+        """Load INI defaults, apply UI sample rate / channels / range, and Commit.
+
+        *input_range* is Gage InputRange in millivolts peak-to-peak
+        (e.g. 2000 for ±1 V).
+        """
         if self.handle is None or self.system_info is None:
             raise RuntimeError("Gage system is not open")
 
@@ -160,8 +171,16 @@ class LiveViewEngine:
         if not enabled:
             enabled = [1]
 
-        key = (sample_rate, tuple(enabled))
-        if key == (self._configured_rate, self._configured_channels):
+        range_mv = int(input_range)
+        if range_mv < 1:
+            range_mv = 2000
+
+        key = (sample_rate, tuple(enabled), range_mv)
+        if key == (
+            self._configured_rate,
+            self._configured_channels,
+            self._configured_input_range,
+        ):
             return
 
         ini = str(self.ini_path)
@@ -187,6 +206,7 @@ class LiveViewEngine:
         for ch in active:
             chan, _ = gs.LoadChannelConfiguration(self.handle, ch, ini)
             if isinstance(chan, dict) and chan:
+                chan["InputRange"] = range_mv
                 status = PyGage.SetChannelConfig(self.handle, ch, chan)
                 if status < 0:
                     raise RuntimeError(PyGage.GetErrorString(status))
@@ -194,6 +214,10 @@ class LiveViewEngine:
         # One trigger engine is enough for basic Live View.
         trig, _ = gs.LoadTriggerConfiguration(self.handle, 1, ini)
         if isinstance(trig, dict) and trig:
+            # Keep external trigger range consistent with the selected input range
+            # when triggering from a channel (Source is typically a channel index).
+            if "ExtRange" in trig:
+                trig["ExtRange"] = range_mv
             status = PyGage.SetTriggerConfig(self.handle, 1, trig)
             if status < 0:
                 raise RuntimeError(PyGage.GetErrorString(status))
@@ -209,9 +233,10 @@ class LiveViewEngine:
 
         self._configured_rate = sample_rate
         self._configured_channels = tuple(enabled)
+        self._configured_input_range = range_mv
         print(
             f"Live View configured: rate={sample_rate} S/s, mode={mode}, "
-            f"channels={self._active_channels}"
+            f"range=±{range_mv / 2:g} mV, channels={self._active_channels}"
         )
 
     def capture(self, enabled_channels: Sequence[int]) -> ChannelData:
@@ -295,6 +320,7 @@ class SimulatedLiveViewEngine:
         self._available = True
         self._t0 = time.monotonic()
         self._configured_rate = 200_000_000
+        self._configured_input_range = 2000  # mV peak-to-peak
         self._active_channels = [1]
 
     @property
@@ -308,25 +334,33 @@ class SimulatedLiveViewEngine:
     def close(self) -> None:
         self._available = False
 
-    def configure(self, sample_rate: int, enabled_channels: Sequence[int]) -> None:
+    def configure(
+        self,
+        sample_rate: int,
+        enabled_channels: Sequence[int],
+        input_range: int = 2000,
+    ) -> None:
         enabled = sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4})
         self._active_channels = enabled or [1]
         self._configured_rate = int(sample_rate)
+        self._configured_input_range = max(1, int(input_range))
 
     def capture(self, enabled_channels: Sequence[int]) -> ChannelData:
         enabled = {int(c) for c in enabled_channels if 1 <= int(c) <= 4}
         channels = [ch for ch in self._active_channels if ch in enabled]
         n = 2040
         t = time.monotonic() - self._t0
+        # Half-scale in volts (±range); keep headroom so the wave is on-screen.
+        half_scale_v = (self._configured_input_range / 1000.0) / 2.0
         x = list(range(n))
         result: ChannelData = {}
         for ch in channels:
             freq = 3.0 + ch  # distinct tone per channel
             phase = t * (1.0 + 0.2 * ch)
-            amp = 0.4 + 0.1 * ch
+            amp = half_scale_v * (0.55 + 0.08 * ch)
             y = [
                 amp * math.sin(2 * math.pi * freq * (i / n) + phase)
-                + 0.05 * math.sin(2 * math.pi * 40 * (i / n) + phase * 0.3)
+                + 0.05 * half_scale_v * math.sin(2 * math.pi * 40 * (i / n) + phase * 0.3)
                 for i in range(n)
             ]
             result[ch] = (x, y)
