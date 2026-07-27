@@ -10,8 +10,13 @@ DEFAULT_INTERFEROGRAMS = 100000
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_SAVE_FILE = ""
 DEFAULT_MODE = "MONITOR"
+DEFAULT_SAMPLERATE = 200000000
 DEFAULT_BULK_LIMIT = 1
 DEFAULT_BULK_UNIT = "GB"
+DEFAULT_CHANNEL1 = True
+DEFAULT_CHANNEL2 = False
+DEFAULT_CHANNEL3 = False
+DEFAULT_CHANNEL4 = False
 BULK_UNITS = ("MB", "GB", "seconds", "minutes")
 VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE")
 
@@ -63,7 +68,7 @@ def load_ui_settings():
     """
     Load persisted UI field values from config.json.
     Returns a dict with keys: interferograms, threshold, save_file, mode,
-    bulk_limit, bulk_unit.
+    samplerate, bulk_limit, bulk_unit, channel1–channel4.
     """
     config = load_config()
 
@@ -88,6 +93,27 @@ def load_ui_settings():
     if mode not in VALID_MODES:
         mode = DEFAULT_MODE
 
+    samplerate = _parse_positive_int(
+        config.get("samplerate", DEFAULT_SAMPLERATE),
+        DEFAULT_SAMPLERATE,
+    )
+
+    channel1 = config.get("channel1", DEFAULT_CHANNEL1)
+    if not isinstance(channel1, bool):
+        channel1 = DEFAULT_CHANNEL1
+
+    channel2 = config.get("channel2", DEFAULT_CHANNEL2)
+    if not isinstance(channel2, bool):
+        channel2 = DEFAULT_CHANNEL2
+
+    channel3 = config.get("channel3", DEFAULT_CHANNEL3)
+    if not isinstance(channel3, bool):
+        channel3 = DEFAULT_CHANNEL3
+
+    channel4 = config.get("channel4", DEFAULT_CHANNEL4)
+    if not isinstance(channel4, bool):
+        channel4 = DEFAULT_CHANNEL4
+
     bulk_limit = _parse_positive_int(
         config.get("bulk_limit", DEFAULT_BULK_LIMIT),
         DEFAULT_BULK_LIMIT,
@@ -102,6 +128,11 @@ def load_ui_settings():
         "threshold": threshold,
         "save_file": save_file,
         "mode": mode,
+        "samplerate": samplerate,
         "bulk_limit": bulk_limit,
         "bulk_unit": bulk_unit,
+        "channel1": channel1,
+        "channel2": channel2,
+        "channel3": channel3,
+        "channel4": channel4,
     }

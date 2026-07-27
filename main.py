@@ -1,31 +1,46 @@
 import dearpygui.dearpygui as dpg
 import playsound3
-from math import sin, cos
 import sys
+import time
 from pathlib import Path
 from enum import Enum
 
 from src.config import save_config, load_ui_settings, BULK_UNITS
 from src.scaling import resolve_font_scale, change_font_scale
+from src.live_view import create_live_view_engine
 
 GAGE_API_DIR = Path(__file__).resolve().parent / "gage_api"
 if str(GAGE_API_DIR) not in sys.path:
     sys.path.insert(0, str(GAGE_API_DIR))
 
-sindatax = []
-sindatay = []
-for i in range(0, 500):
-    sindatax.append(i / 1000)
-    sindatay.append(0.5 + 0.5 * sin(50 * i / 1000))
+# Placeholder empty series so the plot axes exist before the first capture.
+PLACEHOLDER_X = [0.0, 1.0]
+PLACEHOLDER_Y = [0.0, 0.0]
+
+# Distinct colors for Live View channel traces (RGBA 0–255).
+CHANNEL_COLORS = {
+    1: (80, 180, 255, 255),
+    2: (80, 220, 120, 255),
+    3: (255, 180, 60, 255),
+    4: (240, 100, 200, 255),
+}
+
+ALL_CHANNELS = (1, 2, 3, 4)
+
 
 def show_error_window(message):
-    with dpg.window(label="Internal Error", modal=True, tag="error_window"):
-        dpg.add_text(f"An error occurred: {message}")
+    """Show a modal error; safe to call from the main render loop."""
+    if dpg.does_item_exist("error_window"):
+        dpg.delete_item("error_window")
+    with dpg.window(label="Internal Error", modal=True, tag="error_window",
+                    width=900, height=300, pos=(100, 100)):
+        dpg.add_text(f"An error occurred: {message}", wrap=850)
         dpg.add_button(label="Close", callback=lambda: dpg.delete_item("error_window"))
+    try:
         playsound3.playsound("src/half-life-2-episode-2-base-alarm.mp3", block=False)
+    except Exception:
+        pass
 
-    while dpg.does_item_exist("error_window"):
-        dpg.render_dearpygui_frame()
 
 class Mode(Enum):
     MONITOR = 1
@@ -40,19 +55,73 @@ MODE_LABELS = {
 }
 LABEL_TO_MODE = {label: mode for mode, label in MODE_LABELS.items()}
 
+# Display labels for the sample-rate combo, keyed by rate in samples/second.
+SAMPLERATE_LABELS = {
+    1_000: "1 kS/s",
+    2_000: "2 kS/s",
+    5_000: "5 kS/s",
+    10_000: "10 kS/s",
+    20_000: "20 kS/s",
+    50_000: "50 kS/s",
+    100_000: "100 kS/s",
+    200_000: "200 kS/s",
+    500_000: "500 kS/s",
+    1_000_000: "1 MS/s",
+    2_000_000: "2 MS/s",
+    5_000_000: "5 MS/s",
+    10_000_000: "10 MS/s",
+    25_000_000: "25 MS/s",
+    50_000_000: "50 MS/s",
+    100_000_000: "100 MS/s",
+    200_000_000: "200 MS/s",
+}
+LABEL_TO_SAMPLERATE = {label: rate for rate, label in SAMPLERATE_LABELS.items()}
+DEFAULT_SAMPLERATE_LABEL = SAMPLERATE_LABELS[200_000_000]
+
+
+def parse_samplerate_label(label):
+    """Convert a sample-rate combo label (e.g. '200 MS/s') to an int S/s."""
+    if not isinstance(label, str):
+        raise ValueError(f"Invalid sample rate label: {label!r}")
+    if label in LABEL_TO_SAMPLERATE:
+        return LABEL_TO_SAMPLERATE[label]
+    # Fallback for unexpected formatting.
+    value_str = label.replace(" ", "").replace("kS/s", "000").replace("MS/s", "000000")
+    return int(value_str)
+
+
+def samplerate_to_label(rate):
+    """Convert an int sample rate (S/s) to a combo label, or the default."""
+    return SAMPLERATE_LABELS.get(rate, DEFAULT_SAMPLERATE_LABEL)
+
 
 class ifmstate:
     gathering = False
     has_gage = False
     save_file = ""
     mode = Mode.MONITOR
+    samplerate = 200000000
+    channel1 = True
+    channel2 = False
+    channel3 = False
+    channel4 = False
+    live_engine = None
+    live_error = None  # last live-view error string (for one-shot UI report)
+    live_last_tick = 0.0  # monotonic time of last successful capture attempt
 
 ifm = ifmstate()
 
+# Minimum seconds between Live View captures (keeps UI responsive).
+LIVE_VIEW_MIN_INTERVAL_S = 0.03
+
 try:
     import PyGage
-    import GageSupport as gs
-    import GageConstants as gc
+    import GageSupport as gs  # noqa: F401
+    import GageConstants as gc  # noqa: F401
+    # gage_api/PyGage/ is a source tree and can import as an empty namespace
+    # package; require the real extension entry points before enabling hardware.
+    if not all(hasattr(PyGage, name) for name in ("Initialize", "GetSystem", "TransferData")):
+        raise ImportError("PyGage extension is not built/installed")
     ifm.has_gage = True
 except ImportError:
     print("Running in Gage-less mode. PyGage module not found.")
@@ -62,13 +131,32 @@ except ImportError:
 # Change Scale, Exit, and the live plot stay usable.
 SETTINGS_WIDGETS = (
     "mode_combo",
+    "sample_rate_dropdown",
     "interferograms_input",
     "bulk_limit_input",
     "bulk_unit_combo",
     "threshold_slider",
     "save_file_input",
     "browse_button",
+    "channel1_checkbox",
+    "channel2_checkbox",
+    "channel3_checkbox",
+    "channel4_checkbox",
 )
+
+
+def enabled_channels():
+    """Return channel numbers currently checked in the UI / state."""
+    channels = []
+    if ifm.channel1:
+        channels.append(1)
+    if ifm.channel2:
+        channels.append(2)
+    if ifm.channel3:
+        channels.append(3)
+    if ifm.channel4:
+        channels.append(4)
+    return channels
 
 
 def update_mode_dependent_widgets():
@@ -92,6 +180,77 @@ def set_settings_enabled(enabled: bool):
             dpg.disable_item(tag)
 
 
+def set_gathering_ui(gathering: bool):
+    """Sync Start/Stop button and settings lock with gathering state."""
+    ifm.gathering = gathering
+    if gathering:
+        dpg.bind_item_theme("startstop_button", "stop_button_theme")
+        dpg.set_item_label("startstop_button", "Stop")
+        set_settings_enabled(False)
+    else:
+        dpg.bind_item_theme("startstop_button", "start_button_theme")
+        dpg.set_item_label("startstop_button", "Start")
+        set_settings_enabled(True)
+
+
+def series_tag(channel: int) -> str:
+    return f"series{channel}"
+
+
+def update_channel_series_visibility():
+    """Show/hide plot series to match the channel checkboxes."""
+    enabled = set(enabled_channels())
+    for ch in ALL_CHANNELS:
+        tag = series_tag(ch)
+        if dpg.does_item_exist(tag):
+            dpg.configure_item(tag, show=ch in enabled)
+
+
+def apply_live_view_data(channel_data: dict):
+    """Push captured channel data into the Live View plot series."""
+    enabled = set(enabled_channels())
+    for ch in ALL_CHANNELS:
+        tag = series_tag(ch)
+        if not dpg.does_item_exist(tag):
+            continue
+        if ch in channel_data and ch in enabled:
+            x, y = channel_data[ch]
+            dpg.set_value(tag, [x, y])
+            dpg.configure_item(tag, show=True)
+        else:
+            dpg.configure_item(tag, show=ch in enabled)
+            if ch not in enabled:
+                dpg.set_value(tag, [PLACEHOLDER_X, PLACEHOLDER_Y])
+
+
+def live_view_tick():
+    """Capture one Live View frame and update the plot (called from the UI loop)."""
+    engine = ifm.live_engine
+    if engine is None or not ifm.gathering or ifm.mode != Mode.MONITOR:
+        return
+
+    now = time.monotonic()
+    if now - ifm.live_last_tick < LIVE_VIEW_MIN_INTERVAL_S:
+        return
+    ifm.live_last_tick = now
+
+    channels = enabled_channels()
+    if not channels:
+        return
+
+    try:
+        engine.configure(ifm.samplerate, channels)
+        data = engine.capture(channels)
+        apply_live_view_data(data)
+        ifm.live_error = None
+    except Exception as e:
+        msg = str(e)
+        print(f"Live View error: {msg}")
+        ifm.live_error = msg
+        set_gathering_ui(False)
+        show_error_window(msg)
+
+
 def save_ui_settings_from_widgets():
     """Snapshot current main-window field values into config.json."""
     data = {"mode": ifm.mode.name}
@@ -106,6 +265,30 @@ def save_ui_settings_from_widgets():
     if dpg.does_item_exist("save_file_input"):
         data["save_file"] = dpg.get_value("save_file_input") or ""
         ifm.save_file = data["save_file"]
+    if dpg.does_item_exist("mode_combo"):
+        mode_label = dpg.get_value("mode_combo")
+        mode = LABEL_TO_MODE.get(mode_label)
+        if mode is not None:
+            data["mode"] = mode.name
+            ifm.mode = mode
+    if dpg.does_item_exist("sample_rate_dropdown"):
+        try:
+            data["samplerate"] = parse_samplerate_label(dpg.get_value("sample_rate_dropdown"))
+            ifm.samplerate = data["samplerate"]
+        except (TypeError, ValueError):
+            print(f"Invalid sample rate selected: {dpg.get_value('sample_rate_dropdown')}")
+    if dpg.does_item_exist("channel1_checkbox"):
+        data["channel1"] = bool(dpg.get_value("channel1_checkbox"))
+        ifm.channel1 = data["channel1"]
+    if dpg.does_item_exist("channel2_checkbox"):
+        data["channel2"] = bool(dpg.get_value("channel2_checkbox"))
+        ifm.channel2 = data["channel2"]
+    if dpg.does_item_exist("channel3_checkbox"):
+        data["channel3"] = bool(dpg.get_value("channel3_checkbox"))
+        ifm.channel3 = data["channel3"]
+    if dpg.does_item_exist("channel4_checkbox"):
+        data["channel4"] = bool(dpg.get_value("channel4_checkbox"))
+        ifm.channel4 = data["channel4"]
     save_config(data, quiet=True)
 
 def mode_callback(sender, app_data):
@@ -114,29 +297,90 @@ def mode_callback(sender, app_data):
         print(f"Unknown mode selected: {app_data}")
         return
 
+    if ifm.gathering:
+        # Mode changes are locked while running; still defend against stray events.
+        set_gathering_ui(False)
+
     ifm.mode = mode
     update_mode_dependent_widgets()
     save_config({"mode": ifm.mode.name}, quiet=True)
     print(f"Mode set to: {ifm.mode.name}")
 
+def samplerate_callback(sender, app_data):
+    try:
+        value = parse_samplerate_label(app_data)
+    except (TypeError, ValueError):
+        print(f"Invalid sample rate selected: {app_data}")
+        return
+
+    ifm.samplerate = value
+    save_config({"samplerate": ifm.samplerate}, quiet=True)
+    print(f"Sample rate set to: {ifm.samplerate} S/s")
+
+def channel_callback(sender, app_data, user_data):
+    channel_number = user_data
+    enabled = bool(app_data)
+    if channel_number == 1:
+        ifm.channel1 = enabled
+    elif channel_number == 2:
+        ifm.channel2 = enabled
+    elif channel_number == 3:
+        ifm.channel3 = enabled
+    elif channel_number == 4:
+        ifm.channel4 = enabled
+    else:
+        print(f"Unknown channel number: {channel_number}")
+        return
+
+    save_config({
+        "channel1": ifm.channel1,
+        "channel2": ifm.channel2,
+        "channel3": ifm.channel3,
+        "channel4": ifm.channel4,
+    }, quiet=True)
+    update_channel_series_visibility()
+    print(f"Channel {channel_number} set to: {'enabled' if enabled else 'disabled'}")
 
 def button1_callback(sender, app_data):
-    print("Button 1 clicked")
-    playsound3.playsound("src/knopka-iz-igry-2.mp3", block=False)
+    print("Start/Stop clicked")
+    try:
+        playsound3.playsound("src/knopka-iz-igry-2.mp3", block=False)
+    except Exception:
+        pass
+
     if ifm.gathering:
         print("Stopping data gathering...")
-        ifm.gathering = False
-        # set the button color back to green
-        dpg.bind_item_theme("startstop_button", "start_button_theme")
-        dpg.set_item_label("startstop_button", "Start")
-        set_settings_enabled(True)
-    else:
-        print("Starting data gathering...")
-        ifm.gathering = True
-        # set the button color to red
-        dpg.bind_item_theme("startstop_button", "stop_button_theme")
-        dpg.set_item_label("startstop_button", "Stop")
-        set_settings_enabled(False)
+        set_gathering_ui(False)
+        return
+
+    channels = enabled_channels()
+    if not channels:
+        show_error_window("Enable at least one channel before starting.")
+        return
+
+    if ifm.mode == Mode.MONITOR:
+        if ifm.live_engine is None:
+            show_error_window("Live View engine is not available.")
+            return
+        print(
+            f"Starting Live View: rate={ifm.samplerate} S/s, channels={channels}"
+            + ("" if ifm.has_gage else " (simulated)")
+        )
+        try:
+            ifm.live_engine.configure(ifm.samplerate, channels)
+        except Exception as e:
+            show_error_window(f"Failed to configure Live View: {e}")
+            return
+        set_gathering_ui(True)
+        return
+
+    if ifm.mode == Mode.COLLECT:
+        show_error_window("Collect bulk data mode is not implemented yet.")
+        return
+
+    if ifm.mode == Mode.AVERAGE:
+        show_error_window("Average interferograms mode is not implemented yet.")
+        return
 
 def interferograms_callback(sender, app_data):
     try:
@@ -204,11 +448,28 @@ def main():
     ui = load_ui_settings()
     ifm.save_file = ui["save_file"]
     ifm.mode = Mode[ui["mode"]]
+    ifm.samplerate = ui["samplerate"]
+    ifm.channel1 = ui["channel1"]
+    ifm.channel2 = ui["channel2"]
+    ifm.channel3 = ui["channel3"]
+    ifm.channel4 = ui["channel4"]
     print(
-        f"Loaded UI settings: mode={ui['mode']}, interferograms={ui['interferograms']}, "
-        f"bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
+        f"Loaded UI settings: mode={ui['mode']}, samplerate={ui['samplerate']}, "
+        f"channels=[{ui['channel1']}, {ui['channel2']}, {ui['channel3']}, {ui['channel4']}], "
+        f"interferograms={ui['interferograms']}, bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
         f"threshold={ui['threshold']}, save_file={ui['save_file']!r}"
     )
+
+    # Live View engine (real Gage card when available, otherwise simulated).
+    ifm.live_engine = create_live_view_engine(ifm.has_gage)
+    try:
+        ifm.live_engine.open()
+    except Exception as e:
+        print(f"Warning: could not open Live View engine: {e}")
+        # Fall back to simulation so the UI remains usable.
+        ifm.has_gage = False
+        ifm.live_engine = create_live_view_engine(False)
+        ifm.live_engine.open()
 
     with dpg.window(label="Main Window", tag="main_window"):
         dpg.add_button(label="Start", tag="startstop_button", callback=button1_callback)
@@ -254,6 +515,20 @@ def main():
             with dpg.tooltip("bulk_unit_combo"):
                 dpg.add_text("Unit for the collection limit: data size (MB, GB) or duration (seconds, minutes)")
 
+        dpg.add_combo(
+            tag="sample_rate_dropdown",
+            label="Sample Rate",
+            items=list(SAMPLERATE_LABELS.values()),
+            default_value=samplerate_to_label(ifm.samplerate),
+            width=600,
+            callback=samplerate_callback,
+        )
+
+        dpg.add_checkbox(label="Channel 1", tag="channel1_checkbox", default_value=ifm.channel1, callback=channel_callback, user_data=1)
+        dpg.add_checkbox(label="Channel 2", tag="channel2_checkbox", default_value=ifm.channel2, callback=channel_callback, user_data=2)
+        dpg.add_checkbox(label="Channel 3", tag="channel3_checkbox", default_value=ifm.channel3, callback=channel_callback, user_data=3)
+        dpg.add_checkbox(label="Channel 4", tag="channel4_checkbox", default_value=ifm.channel4, callback=channel_callback, user_data=4)
+
         dpg.add_slider_float(
             label="Cross correlational threshold",
             tag="threshold_slider",
@@ -265,7 +540,7 @@ def main():
         with dpg.tooltip("threshold_slider"):
             dpg.add_text("Minimum threshold for cross-correlation to trigger interferogram averaging")
 
-        dpg.add_file_dialog(label="Select save file", directory_selector=False, show=False, callback= save_file_callback, tag="file_dialog", modal=True, width=2000, height=1000)
+        dpg.add_file_dialog(label="Select save file", directory_selector=False, show=False, callback=save_file_callback, tag="file_dialog", modal=True, width=2000, height=1000)
         dpg.add_input_text(
             label="Save file",
             tag="save_file_input",
@@ -289,11 +564,29 @@ def main():
 
         with dpg.plot(label="Live View", tag="chart1", height=800, width=1600):
             dpg.add_plot_legend()
-            dpg.add_plot_axis(dpg.mvXAxis, label="samples")
-            dpg.add_plot_axis(dpg.mvYAxis, label="amplitude", tag="amp")
-            dpg.add_line_series(sindatax, sindatay, label="Channel 1", parent="amp", tag="series1")
+            dpg.add_plot_axis(dpg.mvXAxis, label="samples", tag="live_x_axis")
+            dpg.add_plot_axis(dpg.mvYAxis, label="volts", tag="amp")
+            enabled = set(enabled_channels())
+            for ch in ALL_CHANNELS:
+                dpg.add_line_series(
+                    PLACEHOLDER_X,
+                    PLACEHOLDER_Y,
+                    label=f"Channel {ch}",
+                    parent="amp",
+                    tag=series_tag(ch),
+                    show=ch in enabled,
+                )
 
         dpg.bind_item_font("startstop_button", giant_font)
+
+    # Per-channel series themes (colors).
+    for ch, color in CHANNEL_COLORS.items():
+        theme_tag = f"series{ch}_theme"
+        with dpg.theme(tag=theme_tag):
+            with dpg.theme_component(dpg.mvLineSeries):
+                dpg.add_theme_color(dpg.mvPlotCol_Line, color, category=dpg.mvThemeCat_Plots)
+        if dpg.does_item_exist(series_tag(ch)):
+            dpg.bind_item_theme(series_tag(ch), theme_tag)
 
     with dpg.theme(tag="start_button_theme"):
         with dpg.theme_component(dpg.mvButton):
@@ -313,64 +606,24 @@ def main():
     dpg.maximize_viewport()
     dpg.set_primary_window("main_window", True)
 
-    dpg.start_dearpygui()
+    # Manual frame loop so Live View can capture + refresh between frames.
+    while dpg.is_dearpygui_running():
+        if ifm.gathering and ifm.mode == Mode.MONITOR:
+            live_view_tick()
+        dpg.render_dearpygui_frame()
 
     # Final snapshot so any last edits are retained even if a callback was missed.
     save_ui_settings_from_widgets()
 
-    if not ifm.has_gage:
-        dpg.destroy_context()
-        return
-
-    try:
-        run_gage()
-    except Exception as e:
-        # Show an error window
-        show_error_window(str(e))
+    if ifm.live_engine is not None:
+        try:
+            ifm.live_engine.close()
+        except Exception as e:
+            print(f"Warning: error closing Live View engine: {e}")
+        ifm.live_engine = None
 
     dpg.destroy_context()
 
-
-def run_gage():
-    import PyGage
-    import GageSupport as gs
-    import GageConstants as gc
-    # 1. Init + open first system
-    status = PyGage.Initialize()
-    handle = PyGage.GetSystem(0, 0, 0, 0)
-    if handle < 0:
-        raise RuntimeError(PyGage.GetErrorString(handle))
-
-    # 2. Configure from INI (or set dicts yourself)
-    acq, _ = gs.LoadAcquisitionConfiguration(handle, "src/Acquire.ini")
-    PyGage.SetAcquisitionConfig(handle, acq)
-
-    chan, _ = gs.LoadChannelConfiguration(handle, 1, "src/Acquire.ini")
-    PyGage.SetChannelConfig(handle, 1, chan)
-
-    trig, _ = gs.LoadTriggerConfiguration(handle, 1, "src/Acquire.ini")
-    PyGage.SetTriggerConfig(handle, 1, trig)
-
-    status = PyGage.Commit(handle)
-    if status < 0:
-        raise RuntimeError(PyGage.GetErrorString(status))
-
-    # 3. Capture
-    PyGage.StartCapture(handle)
-    while PyGage.GetStatus(handle) != gc.ACQ_STATUS_READY:
-        pass
-
-    # 4. Transfer
-    buf, start, length = PyGage.TransferData(handle, 1, 0, 1, 0, 2040)
-
-    # 5. Convert raw counts → volts (same formula as SaveVoltageFile)
-    acq = PyGage.GetAcquisitionConfig(handle)
-    chan = PyGage.GetChannelConfig(handle, 1)
-    scale = chan["InputRange"] / 2000.0
-    offset = chan["DcOffset"] / 1000.0
-    volts = ((acq["SampleOffset"] - buf) / acq["SampleResolution"]) * scale + offset
-
-    PyGage.FreeSystem(handle)
 
 if __name__ == "__main__":
     main()
