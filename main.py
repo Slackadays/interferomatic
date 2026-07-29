@@ -5,9 +5,18 @@ import time
 from pathlib import Path
 from enum import Enum
 
-from src.config import save_config, load_ui_settings, BULK_UNITS
+from src.config import (
+    save_config,
+    load_ui_settings,
+    BULK_UNITS,
+    DEFAULT_PRE_TRIGGER_SAMPLES,
+    DEFAULT_POST_TRIGGER_SAMPLES,
+    MIN_PRE_TRIGGER_SAMPLES,
+    MIN_POST_TRIGGER_SAMPLES,
+    MAX_LIVE_SAMPLES,
+)
 from src.scaling import resolve_font_scale, change_font_scale
-from src.live_view import create_live_view_engine
+from src.live_view import create_live_view_engine, normalize_live_window
 
 GAGE_API_DIR = Path(__file__).resolve().parent / "gage_api"
 if str(GAGE_API_DIR) not in sys.path:
@@ -36,6 +45,7 @@ def show_error_window(message):
                     width=900, height=300, pos=(100, 100)):
         dpg.add_text(f"An error occurred: {message}", wrap=850)
         dpg.add_button(label="Close", callback=lambda: dpg.delete_item("error_window"))
+        print("Internal error window displayed:", message)
     try:
         playsound3.playsound("src/half-life-2-episode-2-base-alarm.mp3", block=False)
     except Exception:
@@ -138,6 +148,8 @@ class ifmstate:
     mode = Mode.MONITOR
     samplerate = 200000000
     input_range = 2000  # mV peak-to-peak (±1 V)
+    pre_trigger_samples = DEFAULT_PRE_TRIGGER_SAMPLES
+    post_trigger_samples = DEFAULT_POST_TRIGGER_SAMPLES
     channel1 = True
     channel2 = False
     channel3 = False
@@ -151,16 +163,14 @@ ifm = ifmstate()
 # Minimum seconds between Live View captures (keeps UI responsive).
 LIVE_VIEW_MIN_INTERVAL_S = 0.03
 
-try:
-    import PyGage
-    import GageSupport as gs  # noqa: F401
-    import GageConstants as gc  # noqa: F401
-    # gage_api/PyGage/ is a source tree and can import as an empty namespace
-    # package; require the real extension entry points before enabling hardware.
-    if not all(hasattr(PyGage, name) for name in ("Initialize", "GetSystem", "TransferData")):
-        raise ImportError("PyGage extension is not built/installed")
+# Detect the real PyGage extension without importing it into this process.
+# Loading PyGage here installs Linux signal handlers that race with Dear PyGui's
+# OpenGL threads and corrupt continuous capture (SIGSEGV / stuck READY).
+from src.live_view import gage_extension_available
+
+if gage_extension_available():
     ifm.has_gage = True
-except ImportError:
+else:
     print("Running in Gage-less mode. PyGage module not found.")
 
 
@@ -180,6 +190,8 @@ SETTINGS_WIDGETS = (
     "channel3_checkbox",
     "channel4_checkbox",
     "input_range_dropdown",
+    "pre_trigger_input",
+    "post_trigger_input",
 )
 
 
@@ -244,6 +256,25 @@ def update_channel_series_visibility():
             dpg.configure_item(tag, show=ch in enabled)
 
 
+def input_range_half_scale_volts(range_mv: int) -> float:
+    """Half-scale voltage for a Gage InputRange (mV peak-to-peak)."""
+    return max(1, int(range_mv)) / 2000.0
+
+
+def apply_live_axis_limits():
+    """Lock Live View axes: full bipolar range vertically, pre/post window horizontally."""
+    half_v = input_range_half_scale_volts(ifm.input_range)
+    pre, post = normalize_live_window(
+        ifm.pre_trigger_samples, ifm.post_trigger_samples
+    )
+    if dpg.does_item_exist("amp"):
+        dpg.set_axis_limits("amp", -half_v, half_v)
+    if dpg.does_item_exist("live_x_axis"):
+        # Trigger at sample 0; show [-pre, post).
+        x_max = max(post - 1, 0) if post > 0 else 0
+        dpg.set_axis_limits("live_x_axis", float(-pre), float(x_max))
+
+
 def apply_live_view_data(channel_data: dict):
     """Push captured channel data into the Live View plot series."""
     enabled = set(enabled_channels())
@@ -259,10 +290,12 @@ def apply_live_view_data(channel_data: dict):
             dpg.configure_item(tag, show=ch in enabled)
             if ch not in enabled:
                 dpg.set_value(tag, [PLACEHOLDER_X, PLACEHOLDER_Y])
+    # Re-apply after data updates so auto-fit does not zoom to the noise floor.
+    apply_live_axis_limits()
 
 
 def live_view_tick():
-    """Capture one Live View frame and update the plot (called from the UI loop)."""
+    """Pull the latest Live View frame from the capture worker and update the plot."""
     engine = ifm.live_engine
     if engine is None or not ifm.gathering or ifm.mode != Mode.MONITOR:
         return
@@ -277,14 +310,20 @@ def live_view_tick():
         return
 
     try:
-        engine.configure(ifm.samplerate, channels, ifm.input_range)
         data = engine.capture(channels)
+        # None: worker has not produced a new frame yet.
+        if data is None:
+            return
         apply_live_view_data(data)
         ifm.live_error = None
     except Exception as e:
         msg = str(e)
         print(f"Live View error: {msg}")
         ifm.live_error = msg
+        try:
+            engine.stop()
+        except Exception:
+            pass
         set_gathering_ui(False)
         show_error_window(msg)
 
@@ -321,6 +360,22 @@ def save_ui_settings_from_widgets():
             ifm.input_range = data["input_range"]
         except (TypeError, ValueError):
             print(f"Invalid input range selected: {dpg.get_value('input_range_dropdown')}")
+    if dpg.does_item_exist("pre_trigger_input"):
+        try:
+            data["pre_trigger_samples"] = max(
+                MIN_PRE_TRIGGER_SAMPLES, int(dpg.get_value("pre_trigger_input"))
+            )
+            ifm.pre_trigger_samples = data["pre_trigger_samples"]
+        except (TypeError, ValueError):
+            pass
+    if dpg.does_item_exist("post_trigger_input"):
+        try:
+            data["post_trigger_samples"] = max(
+                MIN_POST_TRIGGER_SAMPLES, int(dpg.get_value("post_trigger_input"))
+            )
+            ifm.post_trigger_samples = data["post_trigger_samples"]
+        except (TypeError, ValueError):
+            pass
     if dpg.does_item_exist("channel1_checkbox"):
         data["channel1"] = bool(dpg.get_value("channel1_checkbox"))
         ifm.channel1 = data["channel1"]
@@ -370,7 +425,55 @@ def input_range_callback(sender, app_data):
 
     ifm.input_range = value
     save_config({"input_range": ifm.input_range}, quiet=True)
+    apply_live_axis_limits()
     print(f"Input range set to: {input_range_to_label(ifm.input_range)} ({ifm.input_range} mV pk-pk)")
+
+
+def _clamp_live_sample_inputs():
+    """Keep pre/post fields valid and within MAX_LIVE_SAMPLES total."""
+    try:
+        pre = int(dpg.get_value("pre_trigger_input")) if dpg.does_item_exist("pre_trigger_input") else ifm.pre_trigger_samples
+    except (TypeError, ValueError):
+        pre = ifm.pre_trigger_samples
+    try:
+        post = int(dpg.get_value("post_trigger_input")) if dpg.does_item_exist("post_trigger_input") else ifm.post_trigger_samples
+    except (TypeError, ValueError):
+        post = ifm.post_trigger_samples
+
+    pre = max(MIN_PRE_TRIGGER_SAMPLES, min(MAX_LIVE_SAMPLES, pre))
+    post = max(MIN_POST_TRIGGER_SAMPLES, min(MAX_LIVE_SAMPLES, post))
+    if pre + post > MAX_LIVE_SAMPLES:
+        # Prefer preserving post-trigger depth when clamping the total.
+        pre = max(MIN_PRE_TRIGGER_SAMPLES, MAX_LIVE_SAMPLES - post)
+    pre, post = normalize_live_window(pre, post)
+    ifm.pre_trigger_samples = pre
+    ifm.post_trigger_samples = post
+    if dpg.does_item_exist("pre_trigger_input"):
+        dpg.set_value("pre_trigger_input", pre)
+    if dpg.does_item_exist("post_trigger_input"):
+        dpg.set_value("post_trigger_input", post)
+    return pre, post
+
+
+def pre_trigger_callback(sender, app_data):
+    pre, post = _clamp_live_sample_inputs()
+    save_config(
+        {"pre_trigger_samples": pre, "post_trigger_samples": post},
+        quiet=True,
+    )
+    apply_live_axis_limits()
+    print(f"Live View window: {pre} pre + {post} post = {pre + post} samples")
+
+
+def post_trigger_callback(sender, app_data):
+    pre, post = _clamp_live_sample_inputs()
+    save_config(
+        {"pre_trigger_samples": pre, "post_trigger_samples": post},
+        quiet=True,
+    )
+    apply_live_axis_limits()
+    print(f"Live View window: {pre} pre + {post} post = {pre + post} samples")
+
 
 def channel_callback(sender, app_data, user_data):
     channel_number = user_data
@@ -405,6 +508,11 @@ def button1_callback(sender, app_data):
 
     if ifm.gathering:
         print("Stopping data gathering...")
+        if ifm.live_engine is not None:
+            try:
+                ifm.live_engine.stop()
+            except Exception:
+                pass
         set_gathering_ui(False)
         return
 
@@ -417,15 +525,29 @@ def button1_callback(sender, app_data):
         if ifm.live_engine is None:
             show_error_window("Live View engine is not available.")
             return
+        pre, post = _clamp_live_sample_inputs()
         print(
             f"Starting Live View: rate={ifm.samplerate} S/s, "
-            f"range={input_range_to_label(ifm.input_range)}, channels={channels}"
+            f"range={input_range_to_label(ifm.input_range)}, "
+            f"window={pre}+{post} samples, channels={channels}"
             + ("" if ifm.has_gage else " (simulated)")
         )
         try:
-            ifm.live_engine.configure(ifm.samplerate, channels, ifm.input_range)
+            ifm.live_engine.configure(
+                ifm.samplerate,
+                channels,
+                ifm.input_range,
+                pre_trigger_samples=pre,
+                post_trigger_samples=post,
+            )
+            ifm.live_engine.start(channels)
+            apply_live_axis_limits()
         except Exception as e:
-            show_error_window(f"Failed to configure Live View: {e}")
+            try:
+                ifm.live_engine.stop()
+            except Exception:
+                pass
+            show_error_window(f"Failed to start Live View: {e}")
             return
         set_gathering_ui(True)
         return
@@ -506,6 +628,8 @@ def main():
     ifm.mode = Mode[ui["mode"]]
     ifm.samplerate = ui["samplerate"]
     ifm.input_range = ui["input_range"]
+    ifm.pre_trigger_samples = ui["pre_trigger_samples"]
+    ifm.post_trigger_samples = ui["post_trigger_samples"]
     ifm.channel1 = ui["channel1"]
     ifm.channel2 = ui["channel2"]
     ifm.channel3 = ui["channel3"]
@@ -513,6 +637,7 @@ def main():
     print(
         f"Loaded UI settings: mode={ui['mode']}, samplerate={ui['samplerate']}, "
         f"input_range={input_range_to_label(ui['input_range'])}, "
+        f"live_window={ui['pre_trigger_samples']}+{ui['post_trigger_samples']}, "
         f"channels=[{ui['channel1']}, {ui['channel2']}, {ui['channel3']}, {ui['channel4']}], "
         f"interferograms={ui['interferograms']}, bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
         f"threshold={ui['threshold']}, save_file={ui['save_file']!r}"
@@ -596,7 +721,35 @@ def main():
             callback=input_range_callback,
         )
         with dpg.tooltip("input_range_dropdown"):
-            dpg.add_text("Full-scale input range for all active channels (Gage InputRange, peak-to-peak)")
+            dpg.add_text("Full-scale input range for all active channels (Gage InputRange, peak-to-peak). Sets the Live View vertical scale.")
+
+        dpg.add_input_int(
+            tag="pre_trigger_input",
+            label="Samples before trigger",
+            default_value=ifm.pre_trigger_samples,
+            width=600,
+            min_value=MIN_PRE_TRIGGER_SAMPLES,
+            max_value=MAX_LIVE_SAMPLES,
+            min_clamped=True,
+            max_clamped=True,
+            callback=pre_trigger_callback,
+        )
+        with dpg.tooltip("pre_trigger_input"):
+            dpg.add_text("Pre-trigger samples shown to the left of the trigger (sample 0)")
+
+        dpg.add_input_int(
+            tag="post_trigger_input",
+            label="Samples after trigger",
+            default_value=ifm.post_trigger_samples,
+            width=600,
+            min_value=MIN_POST_TRIGGER_SAMPLES,
+            max_value=MAX_LIVE_SAMPLES,
+            min_clamped=True,
+            max_clamped=True,
+            callback=post_trigger_callback,
+        )
+        with dpg.tooltip("post_trigger_input"):
+            dpg.add_text("Post-trigger samples shown to the right of the trigger (sample 0). Default total window ≈ 20k samples.")
 
         dpg.add_slider_float(
             label="Cross correlational threshold",
@@ -633,7 +786,7 @@ def main():
 
         with dpg.plot(label="Live View", tag="chart1", height=800, width=1600):
             dpg.add_plot_legend()
-            dpg.add_plot_axis(dpg.mvXAxis, label="samples", tag="live_x_axis")
+            dpg.add_plot_axis(dpg.mvXAxis, label="samples (0 = trigger)", tag="live_x_axis")
             dpg.add_plot_axis(dpg.mvYAxis, label="volts", tag="amp")
             enabled = set(enabled_channels())
             for ch in ALL_CHANNELS:
@@ -645,6 +798,8 @@ def main():
                     tag=series_tag(ch),
                     show=ch in enabled,
                 )
+
+        apply_live_axis_limits()
 
         dpg.bind_item_font("startstop_button", giant_font)
 

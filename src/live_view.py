@@ -1,13 +1,24 @@
 """Live View acquisition for MONITOR mode using the Gage CompuScope API.
 
-Follows the same configure → commit → capture → transfer pattern as
-gage_api/GageAcquire.py, but loops for a continuous scope-style display
-and converts raw samples to volts for plotting.
+Architecture
+------------
+All PyGage / driver calls run in a **child process** started with the ``spawn``
+context. Dear PyGui (and its OpenGL threads) stay in the parent.
+
+Why: on Linux the Gage driver delivers hardware events via a POSIX signal
+handler (``HWEventHandler``) that is not async-signal-safe. Continuous
+single-shot capture in the same process as DPG races with that handler and
+either SIGSEGVs in ``CWinEventHandle::signal`` or leaves the SSM stuck so
+``GetStatus`` never returns READY. Isolating the driver in its own process
+matches the reliability of headless capture and keeps the UI alive even if
+the driver process is restarted after a fault.
 """
 
 from __future__ import annotations
 
+import atexit
 import math
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -19,20 +30,63 @@ GAGE_API_DIR = Path(__file__).resolve().parent.parent / "gage_api"
 if str(GAGE_API_DIR) not in sys.path:
     sys.path.insert(0, str(GAGE_API_DIR))
 
-# Default INI lives next to this package (src/Acquire.ini).
 DEFAULT_INI = Path(__file__).resolve().parent / "Acquire.ini"
 
-# Trigger timeout for free-running live view (100 ns units). 1 ms.
-LIVE_TRIGGER_TIMEOUT = 10_000
+# Acquisition trigger timeout (100 ns units). Used as a safety net when the
+# channel edge never arrives (quiet input) so Live View still refreshes.
+# 100 ms = 1_000_000 * 100 ns.
+LIVE_TRIGGER_TIMEOUT = 1_000_000
 
-# How long to wait for ACQ_STATUS_READY before giving up (seconds).
 CAPTURE_WAIT_TIMEOUT_S = 2.0
+STATUS_POLL_INTERVAL_S = 0.0001
+# ~15 Hz display update; slower than the old 33 Hz loop to reduce driver stress.
+WORKER_MIN_FRAME_INTERVAL_S = 0.065
+POST_COMMIT_READY_TIMEOUT_S = 30.0
 
-ChannelData = Dict[int, Tuple[List[float], List[float]]]  # ch -> (x samples, y volts)
+# How many consecutive child failures before surfacing an error to the UI.
+MAX_CHILD_RESTARTS = 5
+
+# Soft-reset (Abort) the board every N successful frames to clear driver state.
+SOFT_RESET_EVERY_N_FRAMES = 50
+
+# CSE1642 reports CAPS_DEPTH_INCREMENT=32; use that as the default alignment
+# so UI values commit cleanly before the child queries the real cap.
+_DEFAULT_DEPTH_INCREMENT = 32
+
+ChannelData = Dict[int, Tuple[List[float], List[float]]]
+
+
+def _align_samples(n: int, multiple: int = _DEFAULT_DEPTH_INCREMENT) -> int:
+    """Round *n* up to a multiple of *multiple* (minimum 0)."""
+    n = max(0, int(n))
+    multiple = max(1, int(multiple))
+    if n == 0:
+        return 0
+    return ((n + multiple - 1) // multiple) * multiple
+
+
+def normalize_live_window(
+    pre_samples: int,
+    post_samples: int,
+    depth_increment: int = _DEFAULT_DEPTH_INCREMENT,
+) -> Tuple[int, int]:
+    """Sanitize and board-align the Live View pre/post-trigger sample counts.
+
+    Both Depth and SegmentSize must be multiples of CAPS_DEPTH_INCREMENT
+    (32 on CSE1642). Pre-trigger (= SegmentSize − Depth) inherits that
+    constraint when both ends are aligned.
+    """
+    inc = max(1, int(depth_increment))
+    pre = max(0, int(pre_samples))
+    post = max(inc, int(post_samples))
+    pre = _align_samples(pre, inc)
+    post = _align_samples(post, inc)
+    if post < inc:
+        post = inc
+    return pre, post
 
 
 def _mode_for_channels(enabled: Sequence[int]) -> int:
-    """Pick the smallest Gage acquisition mode that covers *enabled* channels."""
     import GageConstants as gc
 
     if not enabled:
@@ -46,12 +100,6 @@ def _mode_for_channels(enabled: Sequence[int]) -> int:
 
 
 def _active_channel_indices(mode: int, channel_count: int, board_count: int) -> List[int]:
-    """Channel indices the card will acquire in this mode.
-
-    On a single board the active set is the first N channels for the mode
-    (Single→1, Dual→1–2, Quad→1–4). Multi-board systems fall back to the
-    Gage SDK CalculateChannelIndexIncrement stride used in the samples.
-    """
     import GageConstants as gc
     import GageSupport as gs
 
@@ -70,7 +118,6 @@ def _active_channel_indices(mode: int, channel_count: int, board_count: int) -> 
 
 
 def raw_to_volts(buffer, acq: dict, chan: dict) -> np.ndarray:
-    """Convert raw ADC counts to volts (same formula as GageSupport.SaveVoltageFile)."""
     samples = np.asarray(buffer, dtype=np.float64)
     scale = chan["InputRange"] / 2000.0
     offset = chan["DcOffset"] / 1000.0
@@ -81,236 +128,778 @@ def raw_to_volts(buffer, acq: dict, chan: dict) -> np.ndarray:
     return ((sample_offset - samples) / sample_res) * scale + offset
 
 
+def _child_abort(handle) -> None:
+    import PyGage
+
+    try:
+        PyGage.AbortCapture(handle)
+    except Exception:
+        pass
+
+
+def _child_wait_ready(handle, timeout_s: float, stop_event: mp.synchronize.Event) -> None:
+    import PyGage
+    import GageConstants as gc
+
+    deadline = time.monotonic() + timeout_s
+    forced = False
+    while not stop_event.is_set():
+        status = PyGage.GetStatus(handle)
+        if status < 0:
+            _child_abort(handle)
+            raise RuntimeError(PyGage.GetErrorString(status))
+        if status == gc.ACQ_STATUS_READY:
+            return
+        now = time.monotonic()
+        if now > deadline:
+            if not forced:
+                force = PyGage.ForceCapture(handle)
+                forced = True
+                if force < 0:
+                    _child_abort(handle)
+                    raise RuntimeError(
+                        f"Capture timed out ({PyGage.GetErrorString(force)})"
+                    )
+                deadline = now + timeout_s
+                time.sleep(STATUS_POLL_INTERVAL_S)
+                continue
+            _child_abort(handle)
+            raise RuntimeError("Capture timed out waiting for ACQ_STATUS_READY")
+        time.sleep(STATUS_POLL_INTERVAL_S)
+    _child_abort(handle)
+    raise RuntimeError("stopped")
+
+
+def _child_configure(
+    handle,
+    system_info: dict,
+    ini: str,
+    sample_rate: int,
+    enabled: List[int],
+    range_mv: int,
+    pre_samples: int,
+    post_samples: int,
+    app_config: dict,
+) -> List[int]:
+    import PyGage
+    import GageSupport as gs
+    import GageConstants as gc
+
+    _child_abort(handle)
+
+    # Align to the board's depth resolution (CSE1642 → 32).
+    depth_inc = _DEFAULT_DEPTH_INCREMENT
+    try:
+        cap = PyGage.GetSystemCaps(handle, gc.CAPS_DEPTH_INCREMENT)
+        if isinstance(cap, int) and cap > 0:
+            depth_inc = cap
+    except Exception:
+        pass
+    try:
+        max_pre = PyGage.GetSystemCaps(handle, gc.CAPS_MAX_PRE_TRIGGER)
+        if not (isinstance(max_pre, int) and max_pre > 0):
+            max_pre = None
+    except Exception:
+        max_pre = None
+
+    pre, post = normalize_live_window(pre_samples, post_samples, depth_inc)
+    if max_pre is not None and pre > max_pre:
+        pre = _align_samples(max_pre, depth_inc)
+        if pre > max_pre:
+            pre = max(0, (max_pre // depth_inc) * depth_inc)
+    total = pre + post
+
+    acq, _ = gs.LoadAcquisitionConfiguration(handle, ini)
+    if not isinstance(acq, dict):
+        raise RuntimeError(PyGage.GetErrorString(acq))
+
+    mode = _mode_for_channels(enabled)
+    acq["Mode"] = mode
+    acq["SampleRate"] = int(sample_rate)
+    acq["TriggerTimeout"] = LIVE_TRIGGER_TIMEOUT
+    acq["SegmentCount"] = 1
+    # Post-trigger depth; SegmentSize holds pre + post so pre-trigger is available.
+    # Both must be multiples of CAPS_DEPTH_INCREMENT or Commit returns
+    # CS_INVALID_SEGMENT_SIZE (-31).
+    acq["Depth"] = post
+    acq["SegmentSize"] = total
+    acq["TriggerHoldoff"] = pre
+    acq["TriggerDelay"] = 0
+
+    status = PyGage.SetAcquisitionConfig(handle, acq)
+    if status < 0:
+        raise RuntimeError(PyGage.GetErrorString(status))
+
+    channel_count = int(system_info["ChannelCount"])
+    board_count = int(system_info["BoardCount"])
+    active = _active_channel_indices(mode, channel_count, board_count)
+
+    for ch in active:
+        chan, _ = gs.LoadChannelConfiguration(handle, ch, ini)
+        if isinstance(chan, dict) and chan:
+            chan["InputRange"] = range_mv
+            status = PyGage.SetChannelConfig(handle, ch, chan)
+            if status < 0:
+                raise RuntimeError(PyGage.GetErrorString(status))
+
+    # Edge trigger on the first enabled channel so the waveform locks with
+    # sample 0 at the trigger crossing (scope-style Live View). Free-run
+    # (Source=Disable) only fires on timeout and does not track the signal.
+    trig_source = enabled[0] if enabled else 1
+    if trig_source not in active:
+        trig_source = active[0]
+
+    trig, _ = gs.LoadTriggerConfiguration(handle, 1, ini)
+    if not isinstance(trig, dict) or not trig:
+        trig = {}
+    trig["Source"] = int(trig_source)
+    trig["Condition"] = gc.CS_TRIG_COND_POS_SLOPE
+    # Level is percent of full-scale (−100…+100). 0 = mid-scale / 0 V for bipolar.
+    trig["Level"] = 0
+    if "ExtRange" in trig:
+        trig["ExtRange"] = range_mv
+    status = PyGage.SetTriggerConfig(handle, 1, trig)
+    if status < 0:
+        raise RuntimeError(PyGage.GetErrorString(status))
+
+    status = PyGage.Commit(handle)
+    if status < 0:
+        raise RuntimeError(PyGage.GetErrorString(status))
+
+    deadline = time.monotonic() + POST_COMMIT_READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        st = PyGage.GetStatus(handle)
+        if st < 0:
+            raise RuntimeError(PyGage.GetErrorString(st))
+        if st == gc.ACQ_STATUS_READY:
+            break
+        time.sleep(0.01)
+    else:
+        raise RuntimeError("Timed out waiting for board READY after Commit")
+
+    # Transfer window relative to trigger: [-pre, +post).
+    app_config["StartPosition"] = -pre
+    app_config["TransferLength"] = total
+    app_config["PreTriggerSamples"] = pre
+    app_config["PostTriggerSamples"] = post
+    app_config["TriggerSource"] = int(trig_source)
+
+    active_out = [ch for ch in active if ch in enabled] or active[:1] or [1]
+    return active_out
+
+
+def _child_transfer(handle, app_config: dict, channels: Sequence[int]) -> ChannelData:
+    import PyGage
+    import GageConstants as gc
+
+    acq = PyGage.GetAcquisitionConfig(handle)
+    if not isinstance(acq, dict):
+        raise RuntimeError(PyGage.GetErrorString(acq))
+
+    start = int(app_config.get("StartPosition", 0))
+    length = int(app_config.get("TransferLength", 2040))
+    min_start = acq["TriggerDelay"] + acq["Depth"] - acq["SegmentSize"]
+    if start < min_start:
+        start = int(min_start)
+    max_length = acq["TriggerDelay"] + acq["Depth"] - min_start
+    if length > max_length:
+        length = int(max_length)
+
+    result: ChannelData = {}
+    for ch in channels:
+        transferred = PyGage.TransferData(
+            handle, ch, gc.TxMODE_DEFAULT, 1, start, length + 64
+        )
+        if isinstance(transferred, int):
+            raise RuntimeError(
+                f"Transfer channel {ch}: {PyGage.GetErrorString(transferred)}"
+            )
+        buf, actual_start, actual_length = transferred
+        chan = PyGage.GetChannelConfig(handle, ch)
+        if not isinstance(chan, dict):
+            raise RuntimeError(PyGage.GetErrorString(chan))
+        volts = raw_to_volts(buf, acq, chan)
+        n = min(int(actual_length), length, len(volts))
+        # Prefer trigger-relative sample indices for the plot (0 = trigger).
+        x0 = int(actual_start) if actual_start is not None else start
+        result[ch] = (
+            list(range(x0, x0 + n)),
+            volts[:n].tolist(),
+        )
+    return result
+
+
+def _child_capture_one(handle, app_config: dict, channels: Sequence[int],
+                       stop_event: mp.synchronize.Event) -> Optional[ChannelData]:
+    import PyGage
+    import GageConstants as gc
+
+    status = PyGage.GetStatus(handle)
+    if status < 0:
+        raise RuntimeError(PyGage.GetErrorString(status))
+    if status == gc.ACQ_STATUS_BUSY_CALIB:
+        return None
+    if status != gc.ACQ_STATUS_READY:
+        _child_abort(handle)
+        time.sleep(0.001)
+
+    status = PyGage.StartCapture(handle)
+    if status < 0:
+        raise RuntimeError(PyGage.GetErrorString(status))
+
+    _child_wait_ready(handle, CAPTURE_WAIT_TIMEOUT_S, stop_event)
+    if stop_event.is_set():
+        return None
+    return _child_transfer(handle, app_config, channels)
+
+
+def _live_view_child_main(
+    cmd_q: mp.Queue,
+    frame_q: mp.Queue,
+    event_q: mp.Queue,
+    stop_event: mp.synchronize.Event,
+    ini_path: str,
+) -> None:
+    """Child process entry: exclusive owner of the Gage system handle."""
+    # Ensure gage_api is importable in the spawned process.
+    if str(GAGE_API_DIR) not in sys.path:
+        sys.path.insert(0, str(GAGE_API_DIR))
+
+    import PyGage
+    import GageSupport as gs
+
+    handle = None
+    system_info = None
+    app_config = None
+    active_channels: List[int] = [1]
+    capturing = False
+    channels: List[int] = [1]
+    frames_since_reset = 0
+    # Last successful configure: (rate, enabled, range_mv, pre, post).
+    last_config: Optional[Tuple[int, List[int], int, int, int]] = None
+
+    def emit(kind: str, payload=None) -> None:
+        try:
+            event_q.put_nowait((kind, payload))
+        except Exception:
+            pass
+
+    def open_board() -> None:
+        nonlocal handle, system_info, app_config
+        if handle is not None:
+            try:
+                _child_abort(handle)
+            except Exception:
+                pass
+            try:
+                PyGage.FreeSystem(handle)
+            except Exception:
+                pass
+            handle = None
+        status = PyGage.Initialize()
+        if status < 0:
+            raise RuntimeError(PyGage.GetErrorString(status))
+        # Resource manager may need a moment after a previous process died.
+        last_err = "No digitizer system found"
+        for attempt in range(10):
+            handle = PyGage.GetSystem(0, 0, 0, 0)
+            if handle >= 0:
+                break
+            last_err = PyGage.GetErrorString(handle)
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(last_err)
+        system_info = PyGage.GetSystemInfo(handle)
+        if not isinstance(system_info, dict):
+            raise RuntimeError(PyGage.GetErrorString(system_info))
+        app_config, _ = gs.LoadApplicationConfiguration(ini_path)
+
+    try:
+        open_board()
+        emit(
+            "ready",
+            {
+                "BoardName": system_info.get("BoardName"),
+                "ChannelCount": system_info.get("ChannelCount"),
+            },
+        )
+
+        while not stop_event.is_set():
+            # Drain commands (non-blocking when capturing).
+            try:
+                if capturing:
+                    cmd = cmd_q.get_nowait()
+                else:
+                    cmd = cmd_q.get(timeout=0.05)
+            except Exception:
+                cmd = None
+
+            if cmd is not None:
+                op = cmd[0]
+                if op == "stop":
+                    break
+                if op == "configure":
+                    _, sample_rate, enabled, range_mv, pre_samples, post_samples = cmd
+                    try:
+                        capturing = False
+                        last_config = (
+                            int(sample_rate),
+                            list(enabled),
+                            int(range_mv),
+                            int(pre_samples),
+                            int(post_samples),
+                        )
+                        active_channels = _child_configure(
+                            handle,
+                            system_info,
+                            ini_path,
+                            last_config[0],
+                            last_config[1],
+                            last_config[2],
+                            last_config[3],
+                            last_config[4],
+                            app_config,
+                        )
+                        channels = list(active_channels)
+                        frames_since_reset = 0
+                        emit(
+                            "configured",
+                            {
+                                "rate": sample_rate,
+                                "channels": active_channels,
+                                "range_mv": range_mv,
+                                "pre": last_config[3],
+                                "post": last_config[4],
+                                "trigger_source": app_config.get(
+                                    "TriggerSource",
+                                    active_channels[0] if active_channels else 1,
+                                ),
+                            },
+                        )
+                    except Exception as e:
+                        emit("error", str(e))
+                elif op == "start":
+                    _, enabled = cmd
+                    enabled_set = {int(c) for c in enabled}
+                    channels = [c for c in active_channels if c in enabled_set] or list(
+                        active_channels[:1]
+                    )
+                    capturing = True
+                elif op == "halt":
+                    capturing = False
+                    _child_abort(handle)
+                elif op == "channels":
+                    _, enabled = cmd
+                    enabled_set = {int(c) for c in enabled}
+                    channels = [c for c in active_channels if c in enabled_set] or list(
+                        active_channels[:1]
+                    )
+
+            if not capturing or stop_event.is_set():
+                continue
+
+            t0 = time.monotonic()
+            try:
+                frame = _child_capture_one(handle, app_config, channels, stop_event)
+            except Exception as e:
+                if stop_event.is_set() or "stopped" in str(e).lower():
+                    break
+                # Recover by re-opening the board and re-applying config once.
+                try:
+                    open_board()
+                    if last_config is not None:
+                        active_channels = _child_configure(
+                            handle,
+                            system_info,
+                            ini_path,
+                            last_config[0],
+                            last_config[1],
+                            last_config[2],
+                            last_config[3],
+                            last_config[4],
+                            app_config,
+                        )
+                        channels = [c for c in active_channels if c in set(channels)] or list(
+                            active_channels[:1]
+                        )
+                    frames_since_reset = 0
+                    continue
+                except Exception as e2:
+                    emit("error", f"{e} (recover failed: {e2})")
+                    capturing = False
+                    continue
+
+            if frame:
+                frames_since_reset += 1
+                if frames_since_reset >= SOFT_RESET_EVERY_N_FRAMES:
+                    _child_abort(handle)
+                    time.sleep(0.002)
+                    frames_since_reset = 0
+                # Keep only the newest frame in the parent.
+                try:
+                    while True:
+                        frame_q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    frame_q.put_nowait(frame)
+                except Exception:
+                    pass
+
+            elapsed = time.monotonic() - t0
+            delay = WORKER_MIN_FRAME_INTERVAL_S - elapsed
+            if delay > 0 and not stop_event.is_set():
+                time.sleep(delay)
+
+    except Exception as e:
+        emit("error", str(e))
+    finally:
+        if handle is not None:
+            try:
+                _child_abort(handle)
+            except Exception:
+                pass
+            try:
+                PyGage.FreeSystem(handle)
+            except Exception:
+                pass
+        emit("exited", None)
+
+
 class LiveViewEngine:
-    """Owns a Gage system handle and performs one-shot captures for Live View."""
+    """Parent-side Live View engine: spawns a Gage child process."""
 
     def __init__(self, ini_path: Optional[Path] = None):
         self.ini_path = Path(ini_path) if ini_path else DEFAULT_INI
-        self.handle: Optional[int] = None
-        self.system_info: Optional[dict] = None
-        self.app_config: Optional[dict] = None
+        self._available = False
+        self._ctx = mp.get_context("spawn")
+        self._cmd_q: Optional[mp.Queue] = None
+        self._frame_q: Optional[mp.Queue] = None
+        self._event_q: Optional[mp.Queue] = None
+        self._stop_event: Optional[mp.synchronize.Event] = None
+        self._proc: Optional[mp.Process] = None
+
         self._configured_rate: Optional[int] = None
         self._configured_channels: Optional[Tuple[int, ...]] = None
         self._configured_input_range: Optional[int] = None
-        self._active_channels: List[int] = [1]
-        self._available = False
+        self._configured_pre: Optional[int] = None
+        self._configured_post: Optional[int] = None
+        self._running = False
+        self._child_restarts = 0
+        self._board_name = "Gage"
+        # (rate, channels, range_mv, pre, post)
+        self._pending_config: Optional[Tuple[int, Tuple[int, ...], int, int, int]] = None
+        self._last_error: Optional[str] = None
+        self._config_ack = False
+        self._last_sent_channels: Optional[Tuple[int, ...]] = None
+        self._atexit_registered = False
 
     @property
     def available(self) -> bool:
         return self._available
 
     def open(self) -> None:
-        """Initialize the Gage driver and open the first system."""
-        import PyGage
+        """Start the Gage child process (does not begin capturing yet)."""
+        if not self._atexit_registered:
+            atexit.register(self._stop_child)
+            self._atexit_registered = True
+        self._start_child()
+        # Wait briefly for the child to open the board.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            self._drain_events()
+            if self._available:
+                print(
+                    f"Gage Live View ready: {self._board_name} "
+                    f"(driver isolated in child process)"
+                )
+                return
+            if self._last_error:
+                raise RuntimeError(self._last_error)
+            time.sleep(0.05)
+        raise RuntimeError("Timed out waiting for Gage child process to open the board")
 
-        status = PyGage.Initialize()
-        if status < 0:
-            raise RuntimeError(PyGage.GetErrorString(status))
-
-        handle = PyGage.GetSystem(0, 0, 0, 0)
-        if handle < 0:
-            raise RuntimeError(PyGage.GetErrorString(handle))
-
-        system_info = PyGage.GetSystemInfo(handle)
-        if not isinstance(system_info, dict):
-            PyGage.FreeSystem(handle)
-            raise RuntimeError(PyGage.GetErrorString(system_info))
-
-        import GageSupport as gs
-
-        app, _ = gs.LoadApplicationConfiguration(str(self.ini_path))
-
-        self.handle = handle
-        self.system_info = system_info
-        self.app_config = app
-        self._available = True
-        print(
-            f"Gage Live View ready: {system_info.get('BoardName', 'unknown')} "
-            f"({system_info.get('ChannelCount', '?')} ch)"
+    def _start_child(self) -> None:
+        self._stop_child()
+        # Give the Gage resource manager time to release a just-killed holder.
+        time.sleep(0.3)
+        self._cmd_q = self._ctx.Queue()
+        self._frame_q = self._ctx.Queue(maxsize=2)
+        self._event_q = self._ctx.Queue()
+        self._stop_event = self._ctx.Event()
+        self._available = False
+        self._last_error = None
+        self._proc = self._ctx.Process(
+            target=_live_view_child_main,
+            args=(
+                self._cmd_q,
+                self._frame_q,
+                self._event_q,
+                self._stop_event,
+                str(self.ini_path),
+            ),
+            name="LiveViewGageChild",
+            daemon=True,
         )
+        self._proc.start()
 
-    def close(self) -> None:
-        """Release the Gage system if open."""
-        if self.handle is None:
-            return
-        try:
-            import PyGage
-
+    def _stop_child(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._cmd_q is not None:
             try:
-                PyGage.AbortCapture(self.handle)
+                self._cmd_q.put_nowait(("stop",))
             except Exception:
                 pass
-            PyGage.FreeSystem(self.handle)
-        finally:
-            self.handle = None
-            self.system_info = None
-            self._available = False
-            self._configured_rate = None
-            self._configured_channels = None
-            self._configured_input_range = None
+        if self._proc is not None:
+            self._proc.join(timeout=3.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2.0)
+            if self._proc.is_alive():
+                self._proc.kill()
+                self._proc.join(timeout=1.0)
+        self._proc = None
+        self._cmd_q = None
+        self._frame_q = None
+        self._event_q = None
+        self._stop_event = None
+        self._available = False
+        self._running = False
+        # Brief pause so CsRm releases the board after process death.
+        time.sleep(0.2)
+
+    def close(self) -> None:
+        self._stop_child()
+        self._configured_rate = None
+        self._configured_channels = None
+        self._configured_input_range = None
+        self._configured_pre = None
+        self._configured_post = None
+
+    def stop(self) -> None:
+        """Halt capture but keep the child (and board handle) alive."""
+        self._running = False
+        if self._cmd_q is not None:
+            try:
+                self._cmd_q.put_nowait(("halt",))
+            except Exception:
+                pass
+        self._drain_frames()
+
+    def _drain_events(self) -> None:
+        if self._event_q is None:
+            return
+        while True:
+            try:
+                kind, payload = self._event_q.get_nowait()
+            except Exception:
+                break
+            if kind == "ready":
+                self._available = True
+                if isinstance(payload, dict):
+                    self._board_name = str(payload.get("BoardName") or "Gage")
+            elif kind == "configured":
+                self._config_ack = True
+                if isinstance(payload, dict):
+                    pre = payload.get("pre")
+                    post = payload.get("post")
+                    window = (
+                        f", window={pre}+{post} samples"
+                        if pre is not None and post is not None
+                        else ""
+                    )
+                    trig_src = payload.get("trigger_source")
+                    trig = f", trigger=CH{trig_src} rising@0%" if trig_src else ""
+                    print(
+                        f"Live View configured: rate={payload.get('rate')} S/s, "
+                        f"range=±{(payload.get('range_mv') or 0) / 2:g} mV, "
+                        f"channels={payload.get('channels')}{window}{trig}"
+                    )
+            elif kind == "error":
+                self._last_error = str(payload)
+            elif kind == "exited":
+                self._available = False
+
+    def _drain_frames(self) -> None:
+        if self._frame_q is None:
+            return
+        while True:
+            try:
+                self._frame_q.get_nowait()
+            except Exception:
+                break
+
+    def _ensure_child(self) -> None:
+        """Restart the child if it died; re-apply last config if needed."""
+        self._drain_events()
+        alive = self._proc is not None and self._proc.is_alive()
+        if alive:
+            return
+        self._child_restarts += 1
+        if self._child_restarts > MAX_CHILD_RESTARTS:
+            raise RuntimeError(
+                self._last_error
+                or "Gage capture process exited repeatedly; check the driver/card"
+            )
+        print(
+            f"Restarting Gage Live View child process "
+            f"(attempt {self._child_restarts}/{MAX_CHILD_RESTARTS})..."
+        )
+        self._start_child()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            self._drain_events()
+            if self._available:
+                break
+            if self._last_error:
+                raise RuntimeError(self._last_error)
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("Gage child process failed to restart")
+
+        if self._pending_config is not None:
+            rate, enabled, range_mv, pre, post = self._pending_config
+            self._send(("configure", rate, list(enabled), range_mv, pre, post))
+            # Wait for configure ack / error briefly.
+            deadline = time.monotonic() + POST_COMMIT_READY_TIMEOUT_S
+            while time.monotonic() < deadline:
+                self._drain_events()
+                if self._last_error:
+                    err = self._last_error
+                    self._last_error = None
+                    raise RuntimeError(err)
+                # configured print is enough; don't block forever
+                if self._configured_rate == rate:
+                    break
+                time.sleep(0.05)
+            self._configured_rate = rate
+            self._configured_channels = enabled
+            self._configured_input_range = range_mv
+            self._configured_pre = pre
+            self._configured_post = post
+
+        if self._running and self._configured_channels is not None:
+            self._send(("start", list(self._configured_channels)))
+
+    def _send(self, cmd: tuple) -> None:
+        if self._cmd_q is None:
+            raise RuntimeError("Gage child process is not running")
+        self._cmd_q.put(cmd)
 
     def configure(
         self,
         sample_rate: int,
         enabled_channels: Sequence[int],
         input_range: int = 2000,
+        pre_trigger_samples: int = 5000,
+        post_trigger_samples: int = 15000,
     ) -> None:
-        """Load INI defaults, apply UI sample rate / channels / range, and Commit.
-
-        *input_range* is Gage InputRange in millivolts peak-to-peak
-        (e.g. 2000 for ±1 V).
-        """
-        if self.handle is None or self.system_info is None:
+        if not self._available and self._proc is None:
             raise RuntimeError("Gage system is not open")
 
-        import PyGage
-        import GageSupport as gs
-        import GageConstants as gc
-
-        enabled = sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4})
+        enabled = tuple(sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4}))
         if not enabled:
-            enabled = [1]
-
+            enabled = (1,)
         range_mv = int(input_range)
         if range_mv < 1:
             range_mv = 2000
+        pre, post = normalize_live_window(pre_trigger_samples, post_trigger_samples)
 
-        key = (sample_rate, tuple(enabled), range_mv)
+        key = (int(sample_rate), enabled, range_mv, pre, post)
+        self._pending_config = key
         if key == (
             self._configured_rate,
             self._configured_channels,
             self._configured_input_range,
+            self._configured_pre,
+            self._configured_post,
         ):
             return
 
-        ini = str(self.ini_path)
-        acq, sts = gs.LoadAcquisitionConfiguration(self.handle, ini)
-        if not isinstance(acq, dict):
-            raise RuntimeError(PyGage.GetErrorString(acq))
+        self._ensure_child()
+        self._last_error = None
+        self._config_ack = False
+        self._send(("configure", int(sample_rate), list(enabled), range_mv, pre, post))
 
-        mode = _mode_for_channels(enabled)
-        acq["Mode"] = mode
-        acq["SampleRate"] = int(sample_rate)
-        # Free-run: auto-trigger after a short timeout so Live View keeps updating.
-        acq["TriggerTimeout"] = LIVE_TRIGGER_TIMEOUT
-        acq["SegmentCount"] = 1
+        # Block until configured or error (Commit + calib can take seconds).
+        deadline = time.monotonic() + POST_COMMIT_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            self._drain_events()
+            if self._last_error:
+                err = self._last_error
+                self._last_error = None
+                raise RuntimeError(err)
+            if self._config_ack:
+                break
+            if self._proc is not None and not self._proc.is_alive():
+                raise RuntimeError(
+                    self._last_error or "Gage child process exited during configure"
+                )
+            time.sleep(0.05)
+        else:
+            raise RuntimeError(
+                "Timed out waiting for Live View configure in child process"
+            )
 
-        status = PyGage.SetAcquisitionConfig(self.handle, acq)
-        if status < 0:
-            raise RuntimeError(PyGage.GetErrorString(status))
-
-        channel_count = int(self.system_info["ChannelCount"])
-        board_count = int(self.system_info["BoardCount"])
-        active = _active_channel_indices(mode, channel_count, board_count)
-
-        for ch in active:
-            chan, _ = gs.LoadChannelConfiguration(self.handle, ch, ini)
-            if isinstance(chan, dict) and chan:
-                chan["InputRange"] = range_mv
-                status = PyGage.SetChannelConfig(self.handle, ch, chan)
-                if status < 0:
-                    raise RuntimeError(PyGage.GetErrorString(status))
-
-        # One trigger engine is enough for basic Live View.
-        trig, _ = gs.LoadTriggerConfiguration(self.handle, 1, ini)
-        if isinstance(trig, dict) and trig:
-            # Keep external trigger range consistent with the selected input range
-            # when triggering from a channel (Source is typically a channel index).
-            if "ExtRange" in trig:
-                trig["ExtRange"] = range_mv
-            status = PyGage.SetTriggerConfig(self.handle, 1, trig)
-            if status < 0:
-                raise RuntimeError(PyGage.GetErrorString(status))
-
-        status = PyGage.Commit(self.handle)
-        if status < 0:
-            raise RuntimeError(PyGage.GetErrorString(status))
-
-        # Only transfer channels that are both active on the card and requested in the UI.
-        self._active_channels = [ch for ch in active if ch in enabled]
-        if not self._active_channels:
-            self._active_channels = active[:1] or [1]
-
-        self._configured_rate = sample_rate
-        self._configured_channels = tuple(enabled)
+        self._configured_rate = int(sample_rate)
+        self._configured_channels = enabled
         self._configured_input_range = range_mv
-        print(
-            f"Live View configured: rate={sample_rate} S/s, mode={mode}, "
-            f"range=±{range_mv / 2:g} mV, channels={self._active_channels}"
-        )
+        self._configured_pre = pre
+        self._configured_post = post
+        self._child_restarts = 0  # healthy configure resets restart budget
 
-    def capture(self, enabled_channels: Sequence[int]) -> ChannelData:
-        """Run one capture and return sample-index / volt arrays for enabled channels."""
-        if self.handle is None or self.app_config is None:
-            raise RuntimeError("Gage system is not open")
+    def start(self, enabled_channels: Sequence[int]) -> None:
+        enabled = [int(c) for c in enabled_channels if 1 <= int(c) <= 4] or [1]
+        self._ensure_child()
+        self._running = True
+        self._send(("start", enabled))
 
-        import PyGage
-        import GageConstants as gc
-
-        enabled = {int(c) for c in enabled_channels if 1 <= int(c) <= 4}
-        channels = [ch for ch in self._active_channels if ch in enabled]
-        if not channels:
+    def capture(self, enabled_channels: Sequence[int]) -> Optional[ChannelData]:
+        """Return the latest frame from the child, or None if none is ready."""
+        enabled = [int(c) for c in enabled_channels if 1 <= int(c) <= 4]
+        if not enabled:
+            self.stop()
             return {}
 
-        status = PyGage.StartCapture(self.handle)
-        if status < 0:
-            raise RuntimeError(PyGage.GetErrorString(status))
+        self._drain_events()
+        if self._last_error:
+            err = self._last_error
+            self._last_error = None
+            self._running = False
+            raise RuntimeError(err)
 
-        deadline = time.monotonic() + CAPTURE_WAIT_TIMEOUT_S
-        status = PyGage.GetStatus(self.handle)
-        while status != gc.ACQ_STATUS_READY:
-            if time.monotonic() > deadline:
-                # Force the trigger so Live View does not hang on a quiet input.
-                force = PyGage.ForceCapture(self.handle)
-                if force < 0:
-                    PyGage.AbortCapture(self.handle)
-                    raise RuntimeError(
-                        f"Capture timed out ({PyGage.GetErrorString(force)})"
-                    )
-                deadline = time.monotonic() + CAPTURE_WAIT_TIMEOUT_S
-            status = PyGage.GetStatus(self.handle)
-            if status < 0:
-                raise RuntimeError(PyGage.GetErrorString(status))
+        if self._proc is not None and not self._proc.is_alive():
+            # Child crashed (e.g. driver SIGSEGV) — restart and continue.
+            code = self._proc.exitcode
+            print(f"Gage Live View child exited (code={code}); recovering...")
+            was_running = self._running
+            self._ensure_child()
+            if was_running:
+                self.start(enabled)
+            return None
 
-        acq = PyGage.GetAcquisitionConfig(self.handle)
-        if not isinstance(acq, dict):
-            raise RuntimeError(PyGage.GetErrorString(acq))
+        enabled_key = tuple(enabled)
+        if self._running:
+            # Keep channel selection in sync (only when it changes).
+            if enabled_key != self._last_sent_channels:
+                try:
+                    self._send(("channels", enabled))
+                    self._last_sent_channels = enabled_key
+                except Exception:
+                    pass
+        else:
+            self.start(enabled)
+            self._last_sent_channels = enabled_key
 
-        start = int(self.app_config.get("StartPosition", 0))
-        length = int(self.app_config.get("TransferLength", 2040))
-
-        # Validate transfer window (same checks as GageAcquire.save_data_to_file).
-        min_start = acq["TriggerDelay"] + acq["Depth"] - acq["SegmentSize"]
-        if start < min_start:
-            start = int(min_start)
-        max_length = acq["TriggerDelay"] + acq["Depth"] - min_start
-        if length > max_length:
-            length = int(max_length)
-
-        result: ChannelData = {}
-        for ch in channels:
-            # +64 padding in case the driver adjusts the transfer length (Gage samples).
-            transferred = PyGage.TransferData(
-                self.handle, ch, gc.TxMODE_DEFAULT, 1, start, length + 64
-            )
-            if isinstance(transferred, int):
-                raise RuntimeError(
-                    f"Transfer channel {ch}: {PyGage.GetErrorString(transferred)}"
-                )
-
-            buf, actual_start, actual_length = transferred
-            chan = PyGage.GetChannelConfig(self.handle, ch)
-            if not isinstance(chan, dict):
-                raise RuntimeError(PyGage.GetErrorString(chan))
-
-            volts = raw_to_volts(buf, acq, chan)
-            # Prefer the requested length when the driver returned extra padding.
-            n = min(int(actual_length), length, len(volts))
-            y = volts[:n].tolist()
-            x = list(range(int(actual_start), int(actual_start) + n))
-            result[ch] = (x, y)
-
-        return result
+        latest: Optional[ChannelData] = None
+        if self._frame_q is not None:
+            while True:
+                try:
+                    latest = self._frame_q.get_nowait()
+                except Exception:
+                    break
+        return latest
 
 
 class SimulatedLiveViewEngine:
@@ -320,8 +909,10 @@ class SimulatedLiveViewEngine:
         self._available = True
         self._t0 = time.monotonic()
         self._configured_rate = 200_000_000
-        self._configured_input_range = 2000  # mV peak-to-peak
+        self._configured_input_range = 2000
         self._active_channels = [1]
+        self._pre = 5000
+        self._post = 15000
 
     @property
     def available(self) -> bool:
@@ -334,33 +925,53 @@ class SimulatedLiveViewEngine:
     def close(self) -> None:
         self._available = False
 
+    def stop(self) -> None:
+        pass
+
+    def start(self, enabled_channels: Sequence[int]) -> None:
+        pass
+
     def configure(
         self,
         sample_rate: int,
         enabled_channels: Sequence[int],
         input_range: int = 2000,
+        pre_trigger_samples: int = 5000,
+        post_trigger_samples: int = 15000,
     ) -> None:
         enabled = sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4})
         self._active_channels = enabled or [1]
         self._configured_rate = int(sample_rate)
         self._configured_input_range = max(1, int(input_range))
+        self._pre, self._post = normalize_live_window(
+            pre_trigger_samples, post_trigger_samples
+        )
+        print(
+            f"Live View configured: rate={sample_rate} S/s, "
+            f"range=±{self._configured_input_range / 2:g} mV, "
+            f"channels={self._active_channels}, "
+            f"window={self._pre}+{self._post} samples (simulated)"
+        )
 
-    def capture(self, enabled_channels: Sequence[int]) -> ChannelData:
+    def capture(self, enabled_channels: Sequence[int]) -> Optional[ChannelData]:
         enabled = {int(c) for c in enabled_channels if 1 <= int(c) <= 4}
         channels = [ch for ch in self._active_channels if ch in enabled]
-        n = 2040
+        pre, post = self._pre, self._post
+        n = pre + post
         t = time.monotonic() - self._t0
-        # Half-scale in volts (±range); keep headroom so the wave is on-screen.
         half_scale_v = (self._configured_input_range / 1000.0) / 2.0
-        x = list(range(n))
+        # Trigger at sample index 0; pre-trigger is negative indices.
+        x = list(range(-pre, post))
         result: ChannelData = {}
         for ch in channels:
-            freq = 3.0 + ch  # distinct tone per channel
+            freq = 3.0 + ch
             phase = t * (1.0 + 0.2 * ch)
             amp = half_scale_v * (0.55 + 0.08 * ch)
             y = [
-                amp * math.sin(2 * math.pi * freq * (i / n) + phase)
-                + 0.05 * half_scale_v * math.sin(2 * math.pi * 40 * (i / n) + phase * 0.3)
+                amp * math.sin(2 * math.pi * freq * (i / max(n, 1)) + phase)
+                + 0.05
+                * half_scale_v
+                * math.sin(2 * math.pi * 40 * (i / max(n, 1)) + phase * 0.3)
                 for i in range(n)
             ]
             result[ch] = (x, y)
@@ -368,19 +979,30 @@ class SimulatedLiveViewEngine:
 
 
 def gage_extension_available() -> bool:
-    """True when the built PyGage extension (not just the source folder) is importable."""
+    """True if the real PyGage extension can be imported in a *fresh* process.
+
+    Intentionally uses a subprocess so this UI process never loads ``PyGage``
+    (and its Linux signal handlers) into the Dear PyGui address space.
+    """
+    import subprocess
+
+    probe = (
+        "import PyGage; assert all(hasattr(PyGage, n) for n in "
+        "('Initialize', 'GetSystem', 'TransferData', 'Commit'))"
+    )
     try:
-        import PyGage
-        return all(
-            hasattr(PyGage, name)
-            for name in ("Initialize", "GetSystem", "TransferData", "Commit")
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            timeout=15,
+            check=False,
         )
-    except ImportError:
+        return result.returncode == 0
+    except Exception:
         return False
 
 
 def create_live_view_engine(has_gage: bool) -> object:
-    """Return a real Gage engine when the card is available, else a simulator."""
     if has_gage and gage_extension_available():
         return LiveViewEngine()
     return SimulatedLiveViewEngine()

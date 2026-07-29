@@ -19,6 +19,13 @@ DEFAULT_CHANNEL1 = True
 DEFAULT_CHANNEL2 = False
 DEFAULT_CHANNEL3 = False
 DEFAULT_CHANNEL4 = False
+# Live View window: samples before / after the trigger (≈20k total by default).
+# Multiples of 32 match CSE1642 CAPS_DEPTH_INCREMENT so Commit accepts them.
+DEFAULT_PRE_TRIGGER_SAMPLES = 5120
+DEFAULT_POST_TRIGGER_SAMPLES = 15360
+MIN_PRE_TRIGGER_SAMPLES = 0
+MIN_POST_TRIGGER_SAMPLES = 32
+MAX_LIVE_SAMPLES = 2_000_000
 BULK_UNITS = ("MB", "GB", "seconds", "minutes")
 VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE")
 # Allowed InputRange values (mV peak-to-peak), matching the UI dropdown.
@@ -64,6 +71,23 @@ def _parse_positive_int(value, default):
     else:
         return default
     if parsed < 1:
+        return default
+    return parsed
+
+
+def _parse_nonneg_int(value, default, minimum=0, maximum=None):
+    """Parse a non-negative integer clamped to [minimum, maximum]."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float) and value == int(value):
+        parsed = int(value)
+    else:
+        return default
+    if parsed < minimum:
+        return default
+    if maximum is not None and parsed > maximum:
         return default
     return parsed
 
@@ -134,6 +158,27 @@ def load_ui_settings():
     if bulk_unit not in BULK_UNITS:
         bulk_unit = DEFAULT_BULK_UNIT
 
+    pre_trigger_samples = _parse_nonneg_int(
+        config.get("pre_trigger_samples", DEFAULT_PRE_TRIGGER_SAMPLES),
+        DEFAULT_PRE_TRIGGER_SAMPLES,
+        minimum=MIN_PRE_TRIGGER_SAMPLES,
+        maximum=MAX_LIVE_SAMPLES,
+    )
+    post_trigger_samples = _parse_nonneg_int(
+        config.get("post_trigger_samples", DEFAULT_POST_TRIGGER_SAMPLES),
+        DEFAULT_POST_TRIGGER_SAMPLES,
+        minimum=MIN_POST_TRIGGER_SAMPLES,
+        maximum=MAX_LIVE_SAMPLES,
+    )
+    if pre_trigger_samples + post_trigger_samples < 1:
+        pre_trigger_samples = DEFAULT_PRE_TRIGGER_SAMPLES
+        post_trigger_samples = DEFAULT_POST_TRIGGER_SAMPLES
+    if pre_trigger_samples + post_trigger_samples > MAX_LIVE_SAMPLES:
+        post_trigger_samples = max(
+            MIN_POST_TRIGGER_SAMPLES,
+            MAX_LIVE_SAMPLES - pre_trigger_samples,
+        )
+
     return {
         "interferograms": interferograms,
         "threshold": threshold,
@@ -147,4 +192,6 @@ def load_ui_settings():
         "channel2": channel2,
         "channel3": channel3,
         "channel4": channel4,
+        "pre_trigger_samples": pre_trigger_samples,
+        "post_trigger_samples": post_trigger_samples,
     }
