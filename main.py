@@ -808,6 +808,27 @@ def main():
 
     dpg.bind_font(default_font)
 
+    with dpg.theme(tag="global_theme"):
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_style(
+                dpg.mvStyleVar_FrameRounding,
+                5,
+                category=dpg.mvThemeCat_Core,
+            )
+            dpg.add_theme_style(
+                dpg.mvStyleVar_WindowPadding,
+                20,
+                10,
+                category=dpg.mvThemeCat_Core,
+            )
+            dpg.add_theme_style(
+                dpg.mvStyleVar_FramePadding,
+                15,
+                6,
+                category=dpg.mvThemeCat_Core,
+            )
+    dpg.bind_theme("global_theme")
+
     dpg.setup_dearpygui()
 
     dpg.show_style_editor()
