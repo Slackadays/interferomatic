@@ -30,6 +30,19 @@ BULK_UNITS = ("MB", "GB", "seconds", "minutes")
 VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE")
 # Allowed InputRange values (mV peak-to-peak), matching the UI dropdown.
 VALID_INPUT_RANGES = (200, 400, 1000, 2000, 4000, 10000)
+# Trigger UI defaults / allowed values (labels match main.py combo items).
+DEFAULT_TRIGGER_SOURCE = "Channel 1"
+DEFAULT_TRIGGER_EDGE = "Rising"
+DEFAULT_TRIGGER_THRESHOLD = 0
+DEFAULT_EXT_TRIGGER_COUPLING = "DC"
+DEFAULT_EXT_TRIGGER_INPUT_RANGE = 2000  # mV pk-pk (±1 V)
+DEFAULT_EXT_TRIGGER_IMPEDANCE = "High Z"
+VALID_TRIGGER_SOURCES = ("Channel 1", "External")
+VALID_TRIGGER_EDGES = ("Rising", "Falling")
+VALID_EXT_TRIGGER_COUPLINGS = ("AC", "DC")
+# Allowed external-trigger ExtRange values (mV peak-to-peak).
+VALID_EXT_TRIGGER_INPUT_RANGES = (2000, 6600, 10000)
+VALID_EXT_TRIGGER_IMPEDANCES = ("50 Ohms", "High Z")
 
 
 def load_config():
@@ -96,7 +109,8 @@ def load_ui_settings():
     """
     Load persisted UI field values from config.json.
     Returns a dict with keys: interferograms, threshold, save_file, mode,
-    samplerate, input_range, bulk_limit, bulk_unit, channel1–channel4.
+    samplerate, input_range, bulk_limit, bulk_unit, channel1–channel4,
+    pre/post trigger samples, and trigger source/edge/threshold/external opts.
     """
     config = load_config()
 
@@ -179,6 +193,43 @@ def load_ui_settings():
             MAX_LIVE_SAMPLES - pre_trigger_samples,
         )
 
+    trigger_source = config.get("trigger_source", DEFAULT_TRIGGER_SOURCE)
+    if trigger_source not in VALID_TRIGGER_SOURCES:
+        trigger_source = DEFAULT_TRIGGER_SOURCE
+
+    trigger_edge = config.get("trigger_edge", DEFAULT_TRIGGER_EDGE)
+    if trigger_edge not in VALID_TRIGGER_EDGES:
+        trigger_edge = DEFAULT_TRIGGER_EDGE
+
+    trigger_threshold = config.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD)
+    if isinstance(trigger_threshold, bool) or not isinstance(
+        trigger_threshold, (int, float)
+    ):
+        trigger_threshold = DEFAULT_TRIGGER_THRESHOLD
+    else:
+        trigger_threshold = int(trigger_threshold)
+        if not (0 <= trigger_threshold <= 100):
+            trigger_threshold = DEFAULT_TRIGGER_THRESHOLD
+
+    ext_trigger_coupling = config.get(
+        "ext_trigger_coupling", DEFAULT_EXT_TRIGGER_COUPLING
+    )
+    if ext_trigger_coupling not in VALID_EXT_TRIGGER_COUPLINGS:
+        ext_trigger_coupling = DEFAULT_EXT_TRIGGER_COUPLING
+
+    ext_trigger_input_range = _parse_positive_int(
+        config.get("ext_trigger_input_range", DEFAULT_EXT_TRIGGER_INPUT_RANGE),
+        DEFAULT_EXT_TRIGGER_INPUT_RANGE,
+    )
+    if ext_trigger_input_range not in VALID_EXT_TRIGGER_INPUT_RANGES:
+        ext_trigger_input_range = DEFAULT_EXT_TRIGGER_INPUT_RANGE
+
+    ext_trigger_impedance = config.get(
+        "ext_trigger_impedance", DEFAULT_EXT_TRIGGER_IMPEDANCE
+    )
+    if ext_trigger_impedance not in VALID_EXT_TRIGGER_IMPEDANCES:
+        ext_trigger_impedance = DEFAULT_EXT_TRIGGER_IMPEDANCE
+
     return {
         "interferograms": interferograms,
         "threshold": threshold,
@@ -194,4 +245,10 @@ def load_ui_settings():
         "channel4": channel4,
         "pre_trigger_samples": pre_trigger_samples,
         "post_trigger_samples": post_trigger_samples,
+        "trigger_source": trigger_source,
+        "trigger_edge": trigger_edge,
+        "trigger_threshold": trigger_threshold,
+        "ext_trigger_coupling": ext_trigger_coupling,
+        "ext_trigger_input_range": ext_trigger_input_range,
+        "ext_trigger_impedance": ext_trigger_impedance,
     }

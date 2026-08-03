@@ -22,7 +22,7 @@ import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
 import numpy as np
 
@@ -31,6 +31,93 @@ if str(GAGE_API_DIR) not in sys.path:
     sys.path.insert(0, str(GAGE_API_DIR))
 
 DEFAULT_INI = Path(__file__).resolve().parent / "Acquire.ini"
+
+
+class TriggerSettings(TypedDict, total=False):
+    """UI-facing trigger options applied on Live View configure/Commit."""
+
+    source: str  # "Channel 1" | "External"
+    edge: str  # "Rising" | "Falling"
+    level: int  # percent of full scale (Gage Level; UI uses 0…100)
+    ext_coupling: str  # "AC" | "DC"
+    ext_range_mv: int  # ExtRange, mV peak-to-peak
+    ext_impedance: str  # "50 Ohms" | "High Z"
+
+
+DEFAULT_TRIGGER_SETTINGS: TriggerSettings = {
+    "source": "Channel 1",
+    "edge": "Rising",
+    "level": 0,
+    "ext_coupling": "DC",
+    "ext_range_mv": 2000,
+    "ext_impedance": "High Z",
+}
+
+
+def normalize_trigger_settings(
+    trigger: Optional[Dict[str, Any]] = None,
+) -> TriggerSettings:
+    """Sanitize trigger options into a stable dict for configure/IPC."""
+    t = trigger if isinstance(trigger, dict) else {}
+    source = str(t.get("source", DEFAULT_TRIGGER_SETTINGS["source"]))
+    if source not in ("Channel 1", "External"):
+        source = DEFAULT_TRIGGER_SETTINGS["source"]
+    edge = str(t.get("edge", DEFAULT_TRIGGER_SETTINGS["edge"]))
+    if edge not in ("Rising", "Falling"):
+        edge = DEFAULT_TRIGGER_SETTINGS["edge"]
+    try:
+        level = int(t.get("level", DEFAULT_TRIGGER_SETTINGS["level"]))
+    except (TypeError, ValueError):
+        level = DEFAULT_TRIGGER_SETTINGS["level"]
+    # Gage Level is −100…+100; clamp to that full range.
+    level = max(-100, min(100, level))
+    ext_coupling = str(
+        t.get("ext_coupling", DEFAULT_TRIGGER_SETTINGS["ext_coupling"])
+    )
+    if ext_coupling not in ("AC", "DC"):
+        ext_coupling = DEFAULT_TRIGGER_SETTINGS["ext_coupling"]
+    try:
+        ext_range_mv = int(
+            t.get("ext_range_mv", DEFAULT_TRIGGER_SETTINGS["ext_range_mv"])
+        )
+    except (TypeError, ValueError):
+        ext_range_mv = DEFAULT_TRIGGER_SETTINGS["ext_range_mv"]
+    if ext_range_mv < 1:
+        ext_range_mv = DEFAULT_TRIGGER_SETTINGS["ext_range_mv"]
+    ext_impedance = str(
+        t.get("ext_impedance", DEFAULT_TRIGGER_SETTINGS["ext_impedance"])
+    )
+    if ext_impedance not in ("50 Ohms", "High Z"):
+        ext_impedance = DEFAULT_TRIGGER_SETTINGS["ext_impedance"]
+    return {
+        "source": source,
+        "edge": edge,
+        "level": level,
+        "ext_coupling": ext_coupling,
+        "ext_range_mv": ext_range_mv,
+        "ext_impedance": ext_impedance,
+    }
+
+
+def trigger_settings_key(trigger: TriggerSettings) -> Tuple:
+    """Hashable key for config-equality checks."""
+    return (
+        trigger["source"],
+        trigger["edge"],
+        trigger["level"],
+        trigger["ext_coupling"],
+        trigger["ext_range_mv"],
+        trigger["ext_impedance"],
+    )
+
+
+def _format_trigger_summary(trigger: TriggerSettings, trig_source: int) -> str:
+    if trigger["source"] == "External" or trig_source == -1:
+        src = "EXT"
+    else:
+        src = f"CH{trig_source}"
+    edge = "rising" if trigger["edge"] == "Rising" else "falling"
+    return f"{src} {edge}@{trigger['level']}%"
 
 # Acquisition trigger timeout (100 ns units). Used as a safety net when the
 # channel edge never arrives (quiet input) so Live View still refreshes.
@@ -51,7 +138,9 @@ SOFT_RESET_EVERY_N_FRAMES = 50
 
 # CSE1642 reports CAPS_DEPTH_INCREMENT=32; use that as the default alignment
 # so UI values commit cleanly before the child queries the real cap.
+# Exported as LIVE_DEPTH_INCREMENT for the UI spinner step (must match).
 _DEFAULT_DEPTH_INCREMENT = 32
+LIVE_DEPTH_INCREMENT = _DEFAULT_DEPTH_INCREMENT
 
 ChannelData = Dict[int, Tuple[List[float], List[float]]]
 
@@ -170,6 +259,66 @@ def _child_wait_ready(handle, timeout_s: float, stop_event: mp.synchronize.Event
     raise RuntimeError("stopped")
 
 
+def _apply_trigger_config(
+    handle,
+    ini: str,
+    trigger: TriggerSettings,
+    enabled: List[int],
+    active: List[int],
+) -> int:
+    """Map UI trigger settings onto Gage trigger engine 1. Returns Source used."""
+    import PyGage
+    import GageSupport as gs
+    import GageConstants as gc
+
+    if trigger["source"] == "External":
+        trig_source = int(gc.CS_TRIG_SOURCE_EXT)
+    else:
+        # "Channel 1" (only internal source offered in the UI today).
+        trig_source = 1
+        if active and trig_source not in active:
+            # In multi-channel modes the first active index is the safe fallback.
+            trig_source = int(active[0])
+        elif not active and enabled:
+            trig_source = int(enabled[0])
+
+    if trigger["edge"] == "Falling":
+        condition = gc.CS_TRIG_COND_NEG_SLOPE
+    else:
+        condition = gc.CS_TRIG_COND_POS_SLOPE
+
+    level = max(-100, min(100, int(trigger["level"])))
+
+    if trigger["ext_coupling"] == "AC":
+        ext_coupling = gc.CS_COUPLING_AC
+    else:
+        ext_coupling = gc.CS_COUPLING_DC
+
+    if trigger["ext_impedance"] == "50 Ohms":
+        ext_impedance = gc.CS_REAL_IMP_50_OHM
+    else:
+        ext_impedance = gc.CS_REAL_IMP_1M_OHM
+
+    ext_range_mv = max(1, int(trigger["ext_range_mv"]))
+
+    trig, _ = gs.LoadTriggerConfiguration(handle, 1, ini)
+    if not isinstance(trig, dict) or not trig:
+        trig = {}
+    trig["Source"] = int(trig_source)
+    trig["Condition"] = int(condition)
+    # Level is percent of full-scale (−100…+100). 0 = mid-scale / 0 V for bipolar.
+    trig["Level"] = int(level)
+    # Always set external-trigger front-end fields; ignored when Source ≠ EXT.
+    trig["ExtCoupling"] = int(ext_coupling)
+    trig["ExtRange"] = int(ext_range_mv)
+    trig["ExtImpedance"] = int(ext_impedance)
+
+    status = PyGage.SetTriggerConfig(handle, 1, trig)
+    if status < 0:
+        raise RuntimeError(PyGage.GetErrorString(status))
+    return int(trig_source)
+
+
 def _child_configure(
     handle,
     system_info: dict,
@@ -180,10 +329,13 @@ def _child_configure(
     pre_samples: int,
     post_samples: int,
     app_config: dict,
+    trigger: Optional[Dict[str, Any]] = None,
 ) -> List[int]:
     import PyGage
     import GageSupport as gs
     import GageConstants as gc
+
+    trigger_settings = normalize_trigger_settings(trigger)
 
     _child_abort(handle)
 
@@ -242,25 +394,9 @@ def _child_configure(
             if status < 0:
                 raise RuntimeError(PyGage.GetErrorString(status))
 
-    # Edge trigger on the first enabled channel so the waveform locks with
-    # sample 0 at the trigger crossing (scope-style Live View). Free-run
-    # (Source=Disable) only fires on timeout and does not track the signal.
-    trig_source = enabled[0] if enabled else 1
-    if trig_source not in active:
-        trig_source = active[0]
-
-    trig, _ = gs.LoadTriggerConfiguration(handle, 1, ini)
-    if not isinstance(trig, dict) or not trig:
-        trig = {}
-    trig["Source"] = int(trig_source)
-    trig["Condition"] = gc.CS_TRIG_COND_POS_SLOPE
-    # Level is percent of full-scale (−100…+100). 0 = mid-scale / 0 V for bipolar.
-    trig["Level"] = 0
-    if "ExtRange" in trig:
-        trig["ExtRange"] = range_mv
-    status = PyGage.SetTriggerConfig(handle, 1, trig)
-    if status < 0:
-        raise RuntimeError(PyGage.GetErrorString(status))
+    trig_source = _apply_trigger_config(
+        handle, ini, trigger_settings, enabled, active
+    )
 
     status = PyGage.Commit(handle)
     if status < 0:
@@ -283,6 +419,7 @@ def _child_configure(
     app_config["PreTriggerSamples"] = pre
     app_config["PostTriggerSamples"] = post
     app_config["TriggerSource"] = int(trig_source)
+    app_config["TriggerSettings"] = dict(trigger_settings)
 
     active_out = [ch for ch in active if ch in enabled] or active[:1] or [1]
     return active_out
@@ -375,8 +512,9 @@ def _live_view_child_main(
     capturing = False
     channels: List[int] = [1]
     frames_since_reset = 0
-    # Last successful configure: (rate, enabled, range_mv, pre, post).
-    last_config: Optional[Tuple[int, List[int], int, int, int]] = None
+    # Last successful configure:
+    # (rate, enabled, range_mv, pre, post, trigger_settings_dict).
+    last_config: Optional[Tuple[int, List[int], int, int, int, dict]] = None
 
     def emit(kind: str, payload=None) -> None:
         try:
@@ -400,15 +538,31 @@ def _live_view_child_main(
         if status < 0:
             raise RuntimeError(PyGage.GetErrorString(status))
         # Resource manager may need a moment after a previous process died.
+        # CS_NO_AVAILABLE_SYSTEM (-21) usually means another app already holds
+        # the exclusive system lock (e.g. CsTestQt / another Interferomatic).
         last_err = "No digitizer system found"
+        last_code = None
         for attempt in range(10):
             handle = PyGage.GetSystem(0, 0, 0, 0)
             if handle >= 0:
                 break
+            last_code = int(handle)
             last_err = PyGage.GetErrorString(handle)
             time.sleep(0.2)
         else:
-            raise RuntimeError(last_err)
+            hint = ""
+            if last_code == -21:
+                hint = (
+                    " The digitizer is already locked by another process "
+                    "(close CsTestQt / cstestqt, GageScope, or a leftover "
+                    "Interferomatic capture child, then retry)."
+                )
+            elif last_code == -8:
+                hint = (
+                    " No CompuScope hardware was detected "
+                    "(check the card, driver, and csrmd resource manager)."
+                )
+            raise RuntimeError(f"{last_err}{hint}")
         system_info = PyGage.GetSystemInfo(handle)
         if not isinstance(system_info, dict):
             raise RuntimeError(PyGage.GetErrorString(system_info))
@@ -439,15 +593,23 @@ def _live_view_child_main(
                 if op == "stop":
                     break
                 if op == "configure":
-                    _, sample_rate, enabled, range_mv, pre_samples, post_samples = cmd
+                    # (op, rate, enabled, range_mv, pre, post[, trigger_dict])
+                    sample_rate = cmd[1]
+                    enabled = cmd[2]
+                    range_mv = cmd[3]
+                    pre_samples = cmd[4]
+                    post_samples = cmd[5]
+                    trigger_in = cmd[6] if len(cmd) > 6 else None
                     try:
                         capturing = False
+                        trig_settings = normalize_trigger_settings(trigger_in)
                         last_config = (
                             int(sample_rate),
                             list(enabled),
                             int(range_mv),
                             int(pre_samples),
                             int(post_samples),
+                            dict(trig_settings),
                         )
                         active_channels = _child_configure(
                             handle,
@@ -459,6 +621,7 @@ def _live_view_child_main(
                             last_config[3],
                             last_config[4],
                             app_config,
+                            trigger=last_config[5],
                         )
                         channels = list(active_channels)
                         frames_since_reset = 0
@@ -474,6 +637,7 @@ def _live_view_child_main(
                                     "TriggerSource",
                                     active_channels[0] if active_channels else 1,
                                 ),
+                                "trigger": dict(trig_settings),
                             },
                         )
                     except Exception as e:
@@ -518,6 +682,7 @@ def _live_view_child_main(
                             last_config[3],
                             last_config[4],
                             app_config,
+                            trigger=last_config[5] if len(last_config) > 5 else None,
                         )
                         channels = [c for c in active_channels if c in set(channels)] or list(
                             active_channels[:1]
@@ -584,11 +749,14 @@ class LiveViewEngine:
         self._configured_input_range: Optional[int] = None
         self._configured_pre: Optional[int] = None
         self._configured_post: Optional[int] = None
+        self._configured_trigger: Optional[Tuple] = None
         self._running = False
         self._child_restarts = 0
         self._board_name = "Gage"
-        # (rate, channels, range_mv, pre, post)
-        self._pending_config: Optional[Tuple[int, Tuple[int, ...], int, int, int]] = None
+        # (rate, channels, range_mv, pre, post, trigger_key, trigger_dict)
+        self._pending_config: Optional[
+            Tuple[int, Tuple[int, ...], int, int, int, Tuple, dict]
+        ] = None
         self._last_error: Optional[str] = None
         self._config_ack = False
         self._last_sent_channels: Optional[Tuple[int, ...]] = None
@@ -676,6 +844,7 @@ class LiveViewEngine:
         self._configured_input_range = None
         self._configured_pre = None
         self._configured_post = None
+        self._configured_trigger = None
 
     def stop(self) -> None:
         """Halt capture but keep the child (and board handle) alive."""
@@ -709,8 +878,16 @@ class LiveViewEngine:
                         if pre is not None and post is not None
                         else ""
                     )
-                    trig_src = payload.get("trigger_source")
-                    trig = f", trigger=CH{trig_src} rising@0%" if trig_src else ""
+                    trig_payload = payload.get("trigger")
+                    if isinstance(trig_payload, dict):
+                        trig_settings = normalize_trigger_settings(trig_payload)
+                        trig_src = int(payload.get("trigger_source", 1) or 1)
+                        trig = (
+                            f", trigger={_format_trigger_summary(trig_settings, trig_src)}"
+                        )
+                    else:
+                        trig_src = payload.get("trigger_source")
+                        trig = f", trigger=CH{trig_src}" if trig_src is not None else ""
                     print(
                         f"Live View configured: rate={payload.get('rate')} S/s, "
                         f"range=±{(payload.get('range_mv') or 0) / 2:g} mV, "
@@ -759,8 +936,10 @@ class LiveViewEngine:
             raise RuntimeError("Gage child process failed to restart")
 
         if self._pending_config is not None:
-            rate, enabled, range_mv, pre, post = self._pending_config
-            self._send(("configure", rate, list(enabled), range_mv, pre, post))
+            rate, enabled, range_mv, pre, post, _trig_key, trig_dict = self._pending_config
+            self._send(
+                ("configure", rate, list(enabled), range_mv, pre, post, trig_dict)
+            )
             # Wait for configure ack / error briefly.
             deadline = time.monotonic() + POST_COMMIT_READY_TIMEOUT_S
             while time.monotonic() < deadline:
@@ -778,6 +957,7 @@ class LiveViewEngine:
             self._configured_input_range = range_mv
             self._configured_pre = pre
             self._configured_post = post
+            self._configured_trigger = _trig_key
 
         if self._running and self._configured_channels is not None:
             self._send(("start", list(self._configured_channels)))
@@ -794,6 +974,7 @@ class LiveViewEngine:
         input_range: int = 2000,
         pre_trigger_samples: int = 5000,
         post_trigger_samples: int = 15000,
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self._available and self._proc is None:
             raise RuntimeError("Gage system is not open")
@@ -805,22 +986,35 @@ class LiveViewEngine:
         if range_mv < 1:
             range_mv = 2000
         pre, post = normalize_live_window(pre_trigger_samples, post_trigger_samples)
+        trig_settings = normalize_trigger_settings(trigger)
+        trig_key = trigger_settings_key(trig_settings)
 
-        key = (int(sample_rate), enabled, range_mv, pre, post)
+        key = (int(sample_rate), enabled, range_mv, pre, post, trig_key, dict(trig_settings))
         self._pending_config = key
-        if key == (
-            self._configured_rate,
-            self._configured_channels,
-            self._configured_input_range,
-            self._configured_pre,
-            self._configured_post,
+        if (
+            int(sample_rate) == self._configured_rate
+            and enabled == self._configured_channels
+            and range_mv == self._configured_input_range
+            and pre == self._configured_pre
+            and post == self._configured_post
+            and trig_key == self._configured_trigger
         ):
             return
 
         self._ensure_child()
         self._last_error = None
         self._config_ack = False
-        self._send(("configure", int(sample_rate), list(enabled), range_mv, pre, post))
+        self._send(
+            (
+                "configure",
+                int(sample_rate),
+                list(enabled),
+                range_mv,
+                pre,
+                post,
+                dict(trig_settings),
+            )
+        )
 
         # Block until configured or error (Commit + calib can take seconds).
         deadline = time.monotonic() + POST_COMMIT_READY_TIMEOUT_S
@@ -847,6 +1041,7 @@ class LiveViewEngine:
         self._configured_input_range = range_mv
         self._configured_pre = pre
         self._configured_post = post
+        self._configured_trigger = trig_key
         self._child_restarts = 0  # healthy configure resets restart budget
 
     def start(self, enabled_channels: Sequence[int]) -> None:
@@ -913,6 +1108,7 @@ class SimulatedLiveViewEngine:
         self._active_channels = [1]
         self._pre = 5000
         self._post = 15000
+        self._trigger: TriggerSettings = dict(DEFAULT_TRIGGER_SETTINGS)
 
     @property
     def available(self) -> bool:
@@ -938,6 +1134,7 @@ class SimulatedLiveViewEngine:
         input_range: int = 2000,
         pre_trigger_samples: int = 5000,
         post_trigger_samples: int = 15000,
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> None:
         enabled = sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4})
         self._active_channels = enabled or [1]
@@ -946,11 +1143,17 @@ class SimulatedLiveViewEngine:
         self._pre, self._post = normalize_live_window(
             pre_trigger_samples, post_trigger_samples
         )
+        self._trigger = normalize_trigger_settings(trigger)
+        trig_src = (
+            -1 if self._trigger["source"] == "External" else 1
+        )
         print(
             f"Live View configured: rate={sample_rate} S/s, "
             f"range=±{self._configured_input_range / 2:g} mV, "
             f"channels={self._active_channels}, "
-            f"window={self._pre}+{self._post} samples (simulated)"
+            f"window={self._pre}+{self._post} samples, "
+            f"trigger={_format_trigger_summary(self._trigger, trig_src)} "
+            f"(simulated)"
         )
 
     def capture(self, enabled_channels: Sequence[int]) -> Optional[ChannelData]:
