@@ -131,10 +131,14 @@ WORKER_MIN_FRAME_INTERVAL_S = 0.065
 POST_COMMIT_READY_TIMEOUT_S = 30.0
 
 # How many consecutive child failures before surfacing an error to the UI.
-MAX_CHILD_RESTARTS = 5
+# A successful capture after a restart clears the counter (see capture()).
+MAX_CHILD_RESTARTS = 8
 
-# Soft-reset (Abort) the board every N successful frames to clear driver state.
-SOFT_RESET_EVERY_N_FRAMES = 50
+# Periodic AbortCapture was used to clear driver state, but on CSE1642 it
+# toggles the on-board input relay every cycle (~few seconds) and is audible.
+# Prefer recovering only when the child actually faults (SIGSEGV / stall).
+# Set to 0 to disable periodic Abort entirely.
+SOFT_RESET_EVERY_N_FRAMES = 0
 
 # CSE1642 reports CAPS_DEPTH_INCREMENT=32; use that as the default alignment
 # so UI values commit cleanly before the child queries the real cap.
@@ -696,7 +700,11 @@ def _live_view_child_main(
 
             if frame:
                 frames_since_reset += 1
-                if frames_since_reset >= SOFT_RESET_EVERY_N_FRAMES:
+                # Optional periodic Abort — disabled by default (relay click).
+                if (
+                    SOFT_RESET_EVERY_N_FRAMES > 0
+                    and frames_since_reset >= SOFT_RESET_EVERY_N_FRAMES
+                ):
                     _child_abort(handle)
                     time.sleep(0.002)
                     frames_since_reset = 0
@@ -790,7 +798,9 @@ class LiveViewEngine:
     def _start_child(self) -> None:
         self._stop_child()
         # Give the Gage resource manager time to release a just-killed holder.
-        time.sleep(0.3)
+        # Back off further when we have been crash-looping.
+        cooldown = 0.5 + 0.4 * min(self._child_restarts, 6)
+        time.sleep(cooldown)
         self._cmd_q = self._ctx.Queue()
         self._frame_q = self._ctx.Queue(maxsize=2)
         self._event_q = self._ctx.Queue()
@@ -811,9 +821,25 @@ class LiveViewEngine:
         )
         self._proc.start()
 
+    def _close_queue(self, q) -> None:
+        """Best-effort close so multiprocessing semaphores do not leak."""
+        if q is None:
+            return
+        try:
+            q.close()
+        except Exception:
+            pass
+        try:
+            q.join_thread()
+        except Exception:
+            pass
+
     def _stop_child(self) -> None:
         if self._stop_event is not None:
-            self._stop_event.set()
+            try:
+                self._stop_event.set()
+            except Exception:
+                pass
         if self._cmd_q is not None:
             try:
                 self._cmd_q.put_nowait(("stop",))
@@ -828,14 +854,20 @@ class LiveViewEngine:
                 self._proc.kill()
                 self._proc.join(timeout=1.0)
         self._proc = None
+        # Close queues after the child is dead so the resource tracker can
+        # reclaim semaphores (rapid SIGSEGV restarts were leaking them).
+        self._close_queue(self._cmd_q)
+        self._close_queue(self._frame_q)
+        self._close_queue(self._event_q)
         self._cmd_q = None
         self._frame_q = None
         self._event_q = None
         self._stop_event = None
         self._available = False
         self._running = False
-        # Brief pause so CsRm releases the board after process death.
-        time.sleep(0.2)
+        # Pause so CsRm releases the board after process death. Longer after
+        # fault recovery so the driver is less likely to GPF immediately.
+        time.sleep(0.5)
 
     def close(self) -> None:
         self._stop_child()
@@ -1094,6 +1126,11 @@ class LiveViewEngine:
                     latest = self._frame_q.get_nowait()
                 except Exception:
                     break
+        # A healthy frame means the child is stable again — allow future
+        # recoveries without burning the consecutive-restart budget on a
+        # multi-hour Average run (SIGSEGV every few hundred frames).
+        if latest is not None and self._child_restarts:
+            self._child_restarts = 0
         return latest
 
 
@@ -1166,17 +1203,23 @@ class SimulatedLiveViewEngine:
         # Trigger at sample index 0; pre-trigger is negative indices.
         x = list(range(-pre, post))
         result: ChannelData = {}
+        # Stable interferogram-like burst near the trigger, with small lag
+        # jitter so Average mode can exercise phase alignment.
+        center = float(pre)  # index of sample 0 in the buffer
+        lag_jitter = int(3.0 * math.sin(t * 2.7))
         for ch in channels:
-            freq = 3.0 + ch
-            phase = t * (1.0 + 0.2 * ch)
             amp = half_scale_v * (0.55 + 0.08 * ch)
-            y = [
-                amp * math.sin(2 * math.pi * freq * (i / max(n, 1)) + phase)
-                + 0.05
-                * half_scale_v
-                * math.sin(2 * math.pi * 40 * (i / max(n, 1)) + phase * 0.3)
-                for i in range(n)
-            ]
+            width = 25.0 + 3.0 * ch
+            carrier = 0.08 + 0.01 * ch
+            y = []
+            for i in range(n):
+                u = (i - center - lag_jitter) / max(width, 1.0)
+                envelope = math.exp(-0.5 * u * u)
+                carrier_term = math.cos(2 * math.pi * carrier * (i - center))
+                noise = 0.02 * half_scale_v * math.sin(
+                    2 * math.pi * (17 + ch) * (i / max(n, 1)) + t * (1.0 + 0.1 * ch)
+                )
+                y.append(amp * envelope * carrier_term + noise)
             result[ch] = (x, y)
         return result
 

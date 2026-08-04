@@ -31,6 +31,7 @@ from src.live_view import (
     normalize_live_window,
     LIVE_DEPTH_INCREMENT,
 )
+from src.averaging import InterferogramAverager, save_averaged_interferograms
 
 GAGE_API_DIR = Path(__file__).resolve().parent / "gage_api"
 if str(GAGE_API_DIR) not in sys.path:
@@ -208,6 +209,16 @@ class ifmstate:
     live_engine = None
     live_error = None  # last live-view error string (for one-shot UI report)
     live_last_tick = 0.0  # monotonic time of last successful capture attempt
+    live_last_frame = 0.0  # monotonic time of last non-empty capture frame
+    # Average-interferograms mode state.
+    threshold = 0.5  # min peak cross-correlation to accept a trace
+    interferograms_target = 100000
+    averager: InterferogramAverager | None = None
+
+# If the Gage child stops delivering frames this long, force a restart.
+# Keep this well above normal trigger gaps so we do not re-Commit (and click
+# the board relay) during ordinary quiet periods between interferograms.
+CAPTURE_STALL_TIMEOUT_S = 30.0
 
 ifm = ifmstate()
 
@@ -274,6 +285,9 @@ def update_mode_dependent_widgets():
     show_bulk = ifm.mode == Mode.COLLECT
     dpg.configure_item("average_controls", show=show_average)
     dpg.configure_item("bulk_controls", show=show_bulk)
+    if dpg.does_item_exist("average_status_text"):
+        if not show_average:
+            dpg.set_value("average_status_text", "")
 
 
 def update_external_trigger_controls():
@@ -308,6 +322,149 @@ def set_gathering_ui(gathering: bool):
         dpg.bind_item_theme("startstop_button", "start_button_theme")
         dpg.set_item_label("startstop_button", "Start")
         set_settings_enabled(True)
+        # Keep the last average on the plot when Average mode finishes;
+        # clear the averager when leaving other modes.
+        if ifm.mode != Mode.AVERAGE:
+            ifm.averager = None
+
+
+def _current_threshold() -> float:
+    if dpg.does_item_exist("threshold_slider"):
+        try:
+            value = float(dpg.get_value("threshold_slider"))
+            return max(0.0, min(1.0, value))
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, min(1.0, float(ifm.threshold)))
+
+
+def _current_interferograms_target() -> int:
+    if dpg.does_item_exist("interferograms_input"):
+        try:
+            return max(1, int(dpg.get_value("interferograms_input")))
+        except (TypeError, ValueError):
+            pass
+    return max(1, int(ifm.interferograms_target))
+
+
+def update_average_status(result=None):
+    """Refresh the Average-mode progress line under the mode controls."""
+    if not dpg.does_item_exist("average_status_text"):
+        return
+    if result is None:
+        if ifm.averager is None:
+            dpg.set_value("average_status_text", "")
+            return
+        result = ifm.averager.snapshot()
+    target = result.target
+    accepted = result.accepted
+    rejected = result.rejected
+    peak = result.last_peak_corr
+    if result.complete:
+        text = (
+            f"Done: {accepted}/{target} averaged "
+            f"({rejected} rejected), last r={peak:.3f}"
+        )
+    elif accepted > 0 or rejected > 0:
+        text = (
+            f"Averaging: {accepted}/{target} accepted, "
+            f"{rejected} rejected, last r={peak:.3f}"
+        )
+    else:
+        text = f"Averaging: 0/{target} (waiting for first trigger)"
+    dpg.set_value("average_status_text", text)
+
+
+def _build_trigger_dict():
+    return {
+        "source": ifm.trigger_source,
+        "edge": ifm.trigger_edge,
+        "level": ifm.trigger_threshold,
+        "ext_coupling": ifm.ext_trigger_coupling,
+        "ext_range_mv": ifm.ext_trigger_input_range,
+        "ext_impedance": ifm.ext_trigger_impedance,
+    }
+
+
+def _start_capture_engine(channels, pre, post, label: str) -> bool:
+    """Configure and start the live capture engine. Returns False on failure."""
+    if ifm.live_engine is None:
+        show_error_window("Live View engine is not available.")
+        return False
+    trigger = _build_trigger_dict()
+    print(
+        f"Starting {label}: rate={ifm.samplerate} S/s, "
+        f"range={input_range_to_label(ifm.input_range)}, "
+        f"window={pre}+{post} samples, channels={channels}, "
+        f"trigger={ifm.trigger_source}/{ifm.trigger_edge}"
+        f"@{ifm.trigger_threshold}%"
+        + (
+            f", ext=[{ifm.ext_trigger_coupling}, "
+            f"{trigger_input_range_to_label(ifm.ext_trigger_input_range)}, "
+            f"{ifm.ext_trigger_impedance}]"
+            if ifm.trigger_source == "External"
+            else ""
+        )
+        + ("" if ifm.has_gage else " (simulated)")
+    )
+    try:
+        ifm.live_engine.configure(
+            ifm.samplerate,
+            channels,
+            ifm.input_range,
+            pre_trigger_samples=pre,
+            post_trigger_samples=post,
+            trigger=trigger,
+        )
+        ifm.live_engine.start(channels)
+        apply_live_axis_limits()
+    except Exception as e:
+        try:
+            ifm.live_engine.stop()
+        except Exception:
+            pass
+        show_error_window(f"Failed to start {label}: {e}")
+        return False
+    return True
+
+
+def _stop_capture_engine():
+    if ifm.live_engine is not None:
+        try:
+            ifm.live_engine.stop()
+        except Exception:
+            pass
+
+
+def finish_averaging(completed: bool):
+    """Stop capture after average mode ends (target reached or user stop)."""
+    _stop_capture_engine()
+    result = ifm.averager.snapshot() if ifm.averager is not None else None
+    if result is not None and result.accepted > 0:
+        apply_live_view_data(ifm.averager.to_channel_data())
+        update_average_status(result)
+        if completed and ifm.save_file:
+            try:
+                path = save_averaged_interferograms(
+                    ifm.save_file,
+                    result,
+                    sample_rate=ifm.samplerate,
+                    threshold=ifm.threshold,
+                    metadata={
+                        "pre_trigger_samples": ifm.pre_trigger_samples,
+                        "post_trigger_samples": ifm.post_trigger_samples,
+                    },
+                )
+                print(f"Saved averaged interferograms to {path}")
+            except Exception as e:
+                show_error_window(f"Failed to save average: {e}")
+        if completed:
+            print(
+                f"Average complete: {result.accepted} accepted, "
+                f"{result.rejected} rejected "
+                f"(threshold r≥{ifm.threshold:.3f})"
+            )
+    set_gathering_ui(False)
 
 
 def series_tag(channel: int) -> str:
@@ -391,6 +548,109 @@ def live_view_tick():
             engine.stop()
         except Exception:
             pass
+        set_gathering_ui(False)
+        show_error_window(msg)
+
+
+def average_tick():
+    """Capture frames, phase-align via cross-correlation, and stack averages."""
+    engine = ifm.live_engine
+    averager = ifm.averager
+    if (
+        engine is None
+        or averager is None
+        or not ifm.gathering
+        or ifm.mode != Mode.AVERAGE
+    ):
+        return
+
+    now = time.monotonic()
+    if now - ifm.live_last_tick < LIVE_VIEW_MIN_INTERVAL_S:
+        return
+    ifm.live_last_tick = now
+
+    channels = enabled_channels()
+    if not channels:
+        return
+
+    try:
+        # Child sometimes stops producing frames without dying (driver stuck
+        # after Abort/ForceCapture). Restart it so long averages can continue.
+        if (
+            ifm.live_last_frame > 0.0
+            and (now - ifm.live_last_frame) > CAPTURE_STALL_TIMEOUT_S
+        ):
+            print(
+                f"Average mode: no frames for "
+                f"{now - ifm.live_last_frame:.1f}s; restarting capture child..."
+            )
+            try:
+                engine.stop()
+            except Exception:
+                pass
+            # Force a full child recycle via the public close/open path if
+            # available; otherwise poke capture() which restarts a dead child.
+            try:
+                if hasattr(engine, "_stop_child"):
+                    engine._stop_child()
+                if hasattr(engine, "_ensure_child"):
+                    engine._ensure_child()
+                engine.start(channels)
+            except Exception as e:
+                raise RuntimeError(f"Failed to recover stalled capture: {e}") from e
+            ifm.live_last_frame = time.monotonic()
+            update_average_status(averager.snapshot())
+            return
+
+        data = engine.capture(channels)
+        if data is None:
+            return
+        # Empty dict: no enabled channels in the frame.
+        if not data:
+            return
+
+        ifm.live_last_frame = time.monotonic()
+        prev_accepted = averager.accepted
+        prev_rejected = averager.rejected
+        result = averager.process_frame(data)
+        ifm.live_error = None
+
+        # Log progress occasionally so long runs (and recoveries) are visible.
+        if result.accepted != prev_accepted or result.rejected != prev_rejected:
+            log_progress = (
+                result.complete
+                or result.accepted <= 3
+                or (
+                    result.accepted > prev_accepted
+                    and result.accepted % 25 == 0
+                )
+                or (
+                    result.rejected > prev_rejected
+                    and result.rejected > 0
+                    and result.rejected % 25 == 0
+                )
+            )
+            if log_progress:
+                print(
+                    f"Average progress: {result.accepted}/{result.target} "
+                    f"accepted, {result.rejected} rejected, "
+                    f"last r={result.last_peak_corr:.3f}, lag={result.last_lag}"
+                )
+
+        # Show the running average (not the raw last capture) on the plot.
+        if result.accepted > 0:
+            apply_live_view_data(averager.to_channel_data())
+        update_average_status(result)
+
+        if result.complete:
+            finish_averaging(completed=True)
+    except Exception as e:
+        msg = str(e)
+        print(f"Average mode error: {msg}")
+        import traceback
+        traceback.print_exc()
+        ifm.live_error = msg
+        _stop_capture_engine()
         set_gathering_ui(False)
         show_error_window(msg)
 
@@ -536,7 +796,11 @@ def input_range_callback(sender, app_data):
 
 
 def _clamp_live_sample_inputs():
-    """Keep pre/post fields valid and within MAX_LIVE_SAMPLES total."""
+    """Keep pre/post fields valid and within MAX_LIVE_SAMPLES total.
+
+    Returns ``(pre, post, changed)`` so callers can skip redundant work when
+    the spinner fires repeatedly at a clamp limit.
+    """
     try:
         pre = int(dpg.get_value("pre_trigger_input")) if dpg.does_item_exist("pre_trigger_input") else ifm.pre_trigger_samples
     except (TypeError, ValueError):
@@ -552,17 +816,24 @@ def _clamp_live_sample_inputs():
         # Prefer preserving post-trigger depth when clamping the total.
         pre = max(MIN_PRE_TRIGGER_SAMPLES, MAX_LIVE_SAMPLES - post)
     pre, post = normalize_live_window(pre, post)
+    changed = (
+        pre != ifm.pre_trigger_samples or post != ifm.post_trigger_samples
+    )
     ifm.pre_trigger_samples = pre
     ifm.post_trigger_samples = post
     if dpg.does_item_exist("pre_trigger_input"):
-        dpg.set_value("pre_trigger_input", pre)
+        if int(dpg.get_value("pre_trigger_input")) != pre:
+            dpg.set_value("pre_trigger_input", pre)
     if dpg.does_item_exist("post_trigger_input"):
-        dpg.set_value("post_trigger_input", post)
-    return pre, post
+        if int(dpg.get_value("post_trigger_input")) != post:
+            dpg.set_value("post_trigger_input", post)
+    return pre, post, changed
 
 
 def pre_trigger_callback(sender, app_data):
-    pre, post = _clamp_live_sample_inputs()
+    pre, post, changed = _clamp_live_sample_inputs()
+    if not changed:
+        return
     save_config(
         {"pre_trigger_samples": pre, "post_trigger_samples": post},
         quiet=True,
@@ -572,7 +843,9 @@ def pre_trigger_callback(sender, app_data):
 
 
 def post_trigger_callback(sender, app_data):
-    pre, post = _clamp_live_sample_inputs()
+    pre, post, changed = _clamp_live_sample_inputs()
+    if not changed:
+        return
     save_config(
         {"pre_trigger_samples": pre, "post_trigger_samples": post},
         quiet=True,
@@ -614,12 +887,11 @@ def button1_callback(sender, app_data):
 
     if ifm.gathering:
         print("Stopping data gathering...")
-        if ifm.live_engine is not None:
-            try:
-                ifm.live_engine.stop()
-            except Exception:
-                pass
-        set_gathering_ui(False)
+        if ifm.mode == Mode.AVERAGE:
+            finish_averaging(completed=False)
+        else:
+            _stop_capture_engine()
+            set_gathering_ui(False)
         return
 
     channels = enabled_channels()
@@ -628,50 +900,8 @@ def button1_callback(sender, app_data):
         return
 
     if ifm.mode == Mode.MONITOR:
-        if ifm.live_engine is None:
-            show_error_window("Live View engine is not available.")
-            return
-        pre, post = _clamp_live_sample_inputs()
-        trigger = {
-            "source": ifm.trigger_source,
-            "edge": ifm.trigger_edge,
-            "level": ifm.trigger_threshold,
-            "ext_coupling": ifm.ext_trigger_coupling,
-            "ext_range_mv": ifm.ext_trigger_input_range,
-            "ext_impedance": ifm.ext_trigger_impedance,
-        }
-        print(
-            f"Starting Live View: rate={ifm.samplerate} S/s, "
-            f"range={input_range_to_label(ifm.input_range)}, "
-            f"window={pre}+{post} samples, channels={channels}, "
-            f"trigger={ifm.trigger_source}/{ifm.trigger_edge}"
-            f"@{ifm.trigger_threshold}%"
-            + (
-                f", ext=[{ifm.ext_trigger_coupling}, "
-                f"{trigger_input_range_to_label(ifm.ext_trigger_input_range)}, "
-                f"{ifm.ext_trigger_impedance}]"
-                if ifm.trigger_source == "External"
-                else ""
-            )
-            + ("" if ifm.has_gage else " (simulated)")
-        )
-        try:
-            ifm.live_engine.configure(
-                ifm.samplerate,
-                channels,
-                ifm.input_range,
-                pre_trigger_samples=pre,
-                post_trigger_samples=post,
-                trigger=trigger,
-            )
-            ifm.live_engine.start(channels)
-            apply_live_axis_limits()
-        except Exception as e:
-            try:
-                ifm.live_engine.stop()
-            except Exception:
-                pass
-            show_error_window(f"Failed to start Live View: {e}")
+        pre, post, _ = _clamp_live_sample_inputs()
+        if not _start_capture_engine(channels, pre, post, "Live View"):
             return
         set_gathering_ui(True)
         return
@@ -681,7 +911,27 @@ def button1_callback(sender, app_data):
         return
 
     if ifm.mode == Mode.AVERAGE:
-        show_error_window("Average interferograms mode is not implemented yet.")
+        pre, post, _ = _clamp_live_sample_inputs()
+        ifm.threshold = _current_threshold()
+        ifm.interferograms_target = _current_interferograms_target()
+        ifm.averager = InterferogramAverager(
+            target=ifm.interferograms_target,
+            threshold=ifm.threshold,
+            reference_channel=channels[0],
+        )
+        print(
+            f"Average mode: target={ifm.interferograms_target}, "
+            f"correlation threshold r≥{ifm.threshold:.3f}, "
+            f"reference channel={channels[0]}"
+        )
+        if not _start_capture_engine(
+            channels, pre, post, "Average interferograms"
+        ):
+            ifm.averager = None
+            return
+        ifm.live_last_frame = time.monotonic()
+        update_average_status(ifm.averager.snapshot())
+        set_gathering_ui(True)
         return
 
 def interferograms_callback(sender, app_data):
@@ -689,7 +939,8 @@ def interferograms_callback(sender, app_data):
         value = int(app_data)
     except (TypeError, ValueError):
         return
-    save_config({"interferograms": value}, quiet=True)
+    ifm.interferograms_target = max(1, value)
+    save_config({"interferograms": ifm.interferograms_target}, quiet=True)
 
 def bulk_limit_callback(sender, app_data):
     try:
@@ -709,7 +960,8 @@ def threshold_callback(sender, app_data):
         value = float(app_data)
     except (TypeError, ValueError):
         return
-    save_config({"threshold": value}, quiet=True)
+    ifm.threshold = max(0.0, min(1.0, value))
+    save_config({"threshold": ifm.threshold}, quiet=True)
 
 def save_file_text_callback(sender, app_data):
     ifm.save_file = app_data if isinstance(app_data, str) else ""
@@ -861,6 +1113,8 @@ def main():
     ifm.channel2 = ui["channel2"]
     ifm.channel3 = ui["channel3"]
     ifm.channel4 = ui["channel4"]
+    ifm.threshold = ui["threshold"]
+    ifm.interferograms_target = ui["interferograms"]
     print(
         f"Loaded UI settings: mode={ui['mode']}, samplerate={ui['samplerate']}, "
         f"input_range={input_range_to_label(ui['input_range'])}, "
@@ -1002,9 +1256,38 @@ def main():
                             )
                             with dpg.tooltip("interferograms_input"):
                                 dpg.add_text(
-                                    "Number of interferograms to collect and "
-                                    "average before stopping"
+                                    "Number of phase-aligned interferograms to "
+                                    "accept into the average before stopping. "
+                                    "Noise falls roughly as 1/sqrt(N)."
                                 )
+
+                            dpg.add_spacer(height=8)
+                            add_settings_label(
+                                "Cross correlational threshold", small_font
+                            )
+                            dpg.add_slider_float(
+                                tag="threshold_slider",
+                                default_value=ui["threshold"],
+                                min_value=0.0,
+                                max_value=1.0,
+                                width=SETTINGS_WIDTH,
+                                callback=threshold_callback,
+                            )
+                            with dpg.tooltip("threshold_slider"):
+                                dpg.add_text(
+                                    "Minimum peak cross-correlation coefficient "
+                                    "(0–1) a new reading must reach against the "
+                                    "running average to be included. The lag at "
+                                    "that peak aligns each interferogram before "
+                                    "averaging."
+                                )
+
+                            dpg.add_spacer(height=8)
+                            status_id = dpg.add_text(
+                                "",
+                                tag="average_status_text",
+                            )
+                            dpg.bind_item_font(status_id, small_font)
                             dpg.add_spacer(height=20)
 
                         with dpg.group(
@@ -1240,29 +1523,6 @@ def main():
                         dpg.add_spacer(height=20)
 
                         with dpg.collapsing_header(
-                            label="Data processing", default_open=True
-                        ):
-
-                            add_settings_label(
-                                "Cross correlational threshold", small_font
-                            )
-                            dpg.add_slider_float(
-                                tag="threshold_slider",
-                                default_value=ui["threshold"],
-                                max_value=1,
-                                width=SETTINGS_WIDTH,
-                                callback=threshold_callback,
-                            )
-                            with dpg.tooltip("threshold_slider"):
-                                dpg.add_text(
-                                    "Minimum threshold for cross-correlation to "
-                                    "trigger interferogram averaging"
-                                )
-
-                        dpg.add_separator()
-                        dpg.add_spacer(height=20)
-
-                        with dpg.collapsing_header(
                             label="Interferomatic settings",
                             default_open=True,
                         ):
@@ -1370,10 +1630,13 @@ def main():
     dpg.maximize_viewport()
     dpg.set_primary_window("main_window", True)
 
-    # Manual frame loop so Live View can capture + refresh between frames.
+    # Manual frame loop so Live View / averaging can capture + refresh.
     while dpg.is_dearpygui_running():
-        if ifm.gathering and ifm.mode == Mode.MONITOR:
-            live_view_tick()
+        if ifm.gathering:
+            if ifm.mode == Mode.MONITOR:
+                live_view_tick()
+            elif ifm.mode == Mode.AVERAGE:
+                average_tick()
         dpg.render_dearpygui_frame()
 
     # Final snapshot so any last edits are retained even if a callback was missed.
