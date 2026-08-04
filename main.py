@@ -827,6 +827,11 @@ def main():
                 6,
                 category=dpg.mvThemeCat_Core,
             )
+            dpg.add_theme_style(
+                dpg.mvPlotStyleVar_LineWeight,
+                4.0,
+                category=dpg.mvThemeCat_Plots
+            )
     dpg.bind_theme("global_theme")
 
     dpg.setup_dearpygui()
@@ -930,15 +935,42 @@ def main():
                         border=False,
                         autosize_x=False,
                         autosize_y=False,
+                        # Without a border, ImGui skips WindowPadding unless this
+                        # is set — so width=-1 controls were flush on the right.
+                        always_use_window_padding=True,
                     ):
                         dpg.add_spacer(height=20)
                         dpg.add_separator()
+                        dpg.add_spacer(height=20)
 
-                        dpg.add_button(
-                            label="Start",
-                            tag="startstop_button",
-                            callback=button1_callback,
-                        )
+                        # Center the Start/Stop button in the settings column.
+                        with dpg.table(
+                            header_row=False,
+                            policy=dpg.mvTable_SizingStretchProp,
+                            borders_innerV=False,
+                            borders_outerV=False,
+                            borders_innerH=False,
+                            borders_outerH=False,
+                            pad_outerX=False,
+                        ):
+                            dpg.add_table_column(
+                                init_width_or_weight=1, width_stretch=True
+                            )
+                            dpg.add_table_column(
+                                init_width_or_weight=0, width_fixed=True
+                            )
+                            dpg.add_table_column(
+                                init_width_or_weight=1, width_stretch=True
+                            )
+                            with dpg.table_row():
+                                dpg.add_table_cell()
+                                with dpg.table_cell():
+                                    dpg.add_button(
+                                        label="Start",
+                                        tag="startstop_button",
+                                        callback=button1_callback,
+                                    )
+                                dpg.add_table_cell()
 
                         dpg.add_spacer(height=20)
                         dpg.add_separator()
