@@ -31,7 +31,11 @@ from src.live_view import (
     normalize_live_window,
     LIVE_DEPTH_INCREMENT,
 )
-from src.averaging import InterferogramAverager, save_averaged_interferograms
+from src.averaging import (
+    InterferogramAverager,
+    format_eta_seconds,
+    save_averaged_interferograms,
+)
 
 GAGE_API_DIR = Path(__file__).resolve().parent / "gage_api"
 if str(GAGE_API_DIR) not in sys.path:
@@ -210,6 +214,11 @@ class ifmstate:
     live_error = None  # last live-view error string (for one-shot UI report)
     live_last_tick = 0.0  # monotonic time of last successful capture attempt
     live_last_frame = 0.0  # monotonic time of last non-empty capture frame
+    # Live View axis reset: force full-window limits for N frames, then unlock
+    # so pan/zoom work. Immediate unlock cancels the reset (never rendered).
+    axis_force_frames = 0
+    axis_unlock_pending = False
+    axis_limits = None  # (x0, x1, y0, y1) last reset target
     # Average-interferograms mode state.
     threshold = 0.5  # min peak cross-correlation to accept a trace
     interferograms_target = 100000
@@ -347,8 +356,29 @@ def _current_interferograms_target() -> int:
     return max(1, int(ifm.interferograms_target))
 
 
+def _settings_panel_text_wrap() -> int:
+    """Pixel wrap width so sidebar text stays left of the vertical divider."""
+    if dpg.does_item_exist("settings_panel"):
+        try:
+            width = dpg.get_item_rect_size("settings_panel")[0]
+            if width and width > 60:
+                # Window padding (20 each side) + a little slack before the border.
+                return max(40, int(width) - 48)
+        except Exception:
+            pass
+    return 280
+
+
+def refresh_settings_text_wraps():
+    """Keep long sidebar labels wrapping inside the settings column."""
+    wrap = _settings_panel_text_wrap()
+    for tag in ("average_status_text", "gage_less_warning"):
+        if dpg.does_item_exist(tag):
+            dpg.configure_item(tag, wrap=wrap)
+
+
 def update_average_status(result=None):
-    """Refresh the Average-mode progress line under the mode controls."""
+    """Refresh the Average-mode progress text under the mode controls."""
     if not dpg.does_item_exist("average_status_text"):
         return
     if result is None:
@@ -360,18 +390,24 @@ def update_average_status(result=None):
     accepted = result.accepted
     rejected = result.rejected
     peak = result.last_peak_corr
+    eta = format_eta_seconds(result.eta_seconds)
+    # Multi-line so a narrow settings column does not clip mid-sentence.
+    # ETA sits to the right of the xxx/xxx counter on the first line.
     if result.complete:
         text = (
-            f"Done: {accepted}/{target} averaged "
-            f"({rejected} rejected), last r={peak:.3f}"
+            f"Done: {accepted}/{target}  ETA 0s\n"
+            f"{rejected} rejected\n"
+            f"last r={peak:.3f}"
         )
     elif accepted > 0 or rejected > 0:
         text = (
-            f"Averaging: {accepted}/{target} accepted, "
-            f"{rejected} rejected, last r={peak:.3f}"
+            f"Averaging: {accepted}/{target}  ETA {eta}\n"
+            f"{rejected} rejected\n"
+            f"last r={peak:.3f}"
         )
     else:
-        text = f"Averaging: 0/{target} (waiting for first trigger)"
+        text = f"Averaging: 0/{target}  ETA …\nwaiting for trigger"
+    refresh_settings_text_wraps()
     dpg.set_value("average_status_text", text)
 
 
@@ -485,18 +521,62 @@ def input_range_half_scale_volts(range_mv: int) -> float:
     return max(1, int(range_mv)) / 2000.0
 
 
-def apply_live_axis_limits():
-    """Lock Live View axes: full bipolar range vertically, pre/post window horizontally."""
+def _live_axis_limit_values():
+    """Return (x0, x1, y0, y1) for the full capture window / input range."""
     half_v = input_range_half_scale_volts(ifm.input_range)
     pre, post = normalize_live_window(
         ifm.pre_trigger_samples, ifm.post_trigger_samples
     )
-    if dpg.does_item_exist("amp"):
-        dpg.set_axis_limits("amp", -half_v, half_v)
+    # Trigger at sample 0; show [-pre, post).
+    x_max = max(post - 1, 0) if post > 0 else 0
+    return (float(-pre), float(x_max), -half_v, half_v)
+
+
+def _push_live_axis_limits():
+    """Apply stored full-window limits (DPG re-applies them every frame until auto)."""
+    if ifm.axis_limits is None:
+        return
+    x0, x1, y0, y1 = ifm.axis_limits
     if dpg.does_item_exist("live_x_axis"):
-        # Trigger at sample 0; show [-pre, post).
-        x_max = max(post - 1, 0) if post > 0 else 0
-        dpg.set_axis_limits("live_x_axis", float(-pre), float(x_max))
+        dpg.set_axis_limits("live_x_axis", x0, x1)
+    if dpg.does_item_exist("amp"):
+        dpg.set_axis_limits("amp", y0, y1)
+
+
+def apply_live_axis_limits():
+    """Reset Live View axes to full bipolar range / pre–post window.
+
+    Dear PyGui only honors ``set_axis_limits`` while the plot is rendered with
+    those limits "armed". Unlocking on the very next loop iteration (before a
+    frame draws) cancels the reset — which is why Reset View appeared broken.
+
+    Strategy: force the target limits for several frames, *then* call
+    ``set_axis_limits_auto`` so the user can pan/zoom from the reset view.
+    """
+    ifm.axis_limits = _live_axis_limit_values()
+    # Hold long enough that at least one full plot render sees the limits.
+    ifm.axis_force_frames = 3
+    ifm.axis_unlock_pending = False
+    _push_live_axis_limits()
+
+
+def process_live_axis_limits():
+    """Per-frame axis reset state machine. Call once before each render."""
+    if ifm.axis_force_frames > 0:
+        # Keep limits armed so ImPlot applies them on this frame's draw.
+        _push_live_axis_limits()
+        ifm.axis_force_frames -= 1
+        if ifm.axis_force_frames == 0:
+            # Unlock on the *following* frame, after this forced view is drawn.
+            ifm.axis_unlock_pending = True
+        return
+
+    if ifm.axis_unlock_pending:
+        ifm.axis_unlock_pending = False
+        if dpg.does_item_exist("amp"):
+            dpg.set_axis_limits_auto("amp")
+        if dpg.does_item_exist("live_x_axis"):
+            dpg.set_axis_limits_auto("live_x_axis")
 
 
 def apply_live_view_data(channel_data: dict):
@@ -514,8 +594,7 @@ def apply_live_view_data(channel_data: dict):
             dpg.configure_item(tag, show=ch in enabled)
             if ch not in enabled:
                 dpg.set_value(tag, [PLACEHOLDER_X, PLACEHOLDER_Y])
-    # Re-apply after data updates so auto-fit does not zoom to the noise floor.
-    apply_live_axis_limits()
+    # Do not re-apply axis limits here — that would cancel pan/zoom every frame.
 
 
 def live_view_tick():
@@ -1226,6 +1305,17 @@ def main():
                                     )
                                 dpg.add_table_cell()
 
+                        if not ifm.has_gage:
+                            dpg.add_spacer(height=12)
+                            gage_warn = dpg.add_text(
+                                "Warning: No Gage card detected! "
+                                "Now using fake sample data",
+                                tag="gage_less_warning",
+                                color=(255, 170, 40, 255),
+                                wrap=280,
+                            )
+                            dpg.bind_item_font(gage_warn, small_font)
+
                         dpg.add_spacer(height=20)
                         dpg.add_separator()
 
@@ -1286,6 +1376,7 @@ def main():
                             status_id = dpg.add_text(
                                 "",
                                 tag="average_status_text",
+                                wrap=280,
                             )
                             dpg.bind_item_font(status_id, small_font)
                             dpg.add_spacer(height=20)
@@ -1572,11 +1663,27 @@ def main():
                         autosize_x=False,
                         autosize_y=False,
                     ):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(
+                                label="Reset View",
+                                tag="reset_view_button",
+                                callback=lambda: apply_live_axis_limits(),
+                            )
+                            with dpg.tooltip("reset_view_button"):
+                                dpg.add_text(
+                                    "Reset zoom/pan to the full capture window.\n"
+                                    "Scroll = zoom, right-drag = pan, "
+                                    "right-drag box = zoom to region, "
+                                    "double-click axis = fit."
+                                )
                         with dpg.plot(
                             label="Live View",
                             tag="chart1",
                             height=-1,
                             width=-1,
+                            no_inputs=False,
+                            no_menus=False,
+                            no_box_select=False,
                         ):
                             dpg.add_plot_legend()
                             dpg.add_plot_axis(
@@ -1630,13 +1737,25 @@ def main():
     dpg.maximize_viewport()
     dpg.set_primary_window("main_window", True)
 
+    # Let layout settle so sidebar wrap width matches the settings column.
+    for _ in range(3):
+        dpg.render_dearpygui_frame()
+    refresh_settings_text_wraps()
+
     # Manual frame loop so Live View / averaging can capture + refresh.
+    # Re-measure wrap occasionally in case the user drags the column divider.
+    wrap_refresh_counter = 0
     while dpg.is_dearpygui_running():
+        process_live_axis_limits()
         if ifm.gathering:
             if ifm.mode == Mode.MONITOR:
                 live_view_tick()
             elif ifm.mode == Mode.AVERAGE:
                 average_tick()
+        wrap_refresh_counter += 1
+        if wrap_refresh_counter >= 30:
+            wrap_refresh_counter = 0
+            refresh_settings_text_wraps()
         dpg.render_dearpygui_frame()
 
     # Final snapshot so any last edits are retained even if a callback was missed.

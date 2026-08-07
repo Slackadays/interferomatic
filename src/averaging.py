@@ -9,14 +9,38 @@ glitches), so the final stack SNR improves roughly as sqrt(N).
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 # ChannelData-compatible: channel -> (x samples, y volts)
 ChannelData = Dict[int, Tuple[List[float], List[float]]]
+
+# Window for accept-rate / ETA estimates (number of accepted timestamps).
+ETA_ACCEPT_WINDOW = 40
+# Only refresh the displayed ETA after this many new accepts (keeps UI legible).
+ETA_UPDATE_EVERY = 10
+
+
+def format_eta_seconds(seconds: Optional[float]) -> str:
+    """Human-readable ETA, e.g. ``45s``, ``12m 03s``, ``1h 05m``."""
+    if seconds is None or seconds < 0 or not np.isfinite(seconds):
+        return "…"
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h {minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours:02d}h"
 
 
 def circular_cross_correlation(
@@ -84,6 +108,8 @@ class AverageResult:
     last_peak_corr: float = 0.0
     last_lag: int = 0
     complete: bool = False
+    # Seconds remaining, or None if not enough accepts yet / complete.
+    eta_seconds: Optional[float] = None
     # channel -> averaged y (only when accepted > 0)
     averages: Dict[int, np.ndarray] = field(default_factory=dict)
     x: Optional[np.ndarray] = None
@@ -109,6 +135,11 @@ class InterferogramAverager:
         self._x: Optional[np.ndarray] = None
         self._length: Optional[int] = None
         self._channels: Tuple[int, ...] = ()
+        # Monotonic timestamps of the last N accepted interferograms.
+        self._accept_times: Deque[float] = deque(maxlen=ETA_ACCEPT_WINDOW)
+        # Displayed ETA is only recomputed every ETA_UPDATE_EVERY accepts.
+        self._displayed_eta_seconds: Optional[float] = None
+        self._eta_last_update_accepted: int = 0
 
     @property
     def complete(self) -> bool:
@@ -123,6 +154,55 @@ class InterferogramAverager:
         self._x = None
         self._length = None
         self._channels = ()
+        self._accept_times.clear()
+        self._displayed_eta_seconds = None
+        self._eta_last_update_accepted = 0
+
+    def _record_accept(self) -> None:
+        self._accept_times.append(time.monotonic())
+        self._maybe_refresh_displayed_eta()
+
+    def _compute_eta_seconds(self) -> Optional[float]:
+        """Raw ETA from the last ≤ETA_ACCEPT_WINDOW accept timestamps."""
+        if self.complete:
+            return 0.0
+        times = self._accept_times
+        if len(times) < 2:
+            return None
+        elapsed = times[-1] - times[0]
+        if elapsed <= 1e-9:
+            return None
+        n_intervals = len(times) - 1
+        rate = n_intervals / elapsed  # accepts per second
+        remaining = self.target - self.accepted
+        if remaining <= 0:
+            return 0.0
+        return remaining / rate
+
+    def _maybe_refresh_displayed_eta(self) -> None:
+        """Update the sticky displayed ETA every ETA_UPDATE_EVERY accepts."""
+        if self.complete:
+            self._displayed_eta_seconds = 0.0
+            self._eta_last_update_accepted = self.accepted
+            return
+        # Hold the previous value between milestones so the UI stays legible.
+        if self.accepted % ETA_UPDATE_EVERY != 0:
+            return
+        eta = self._compute_eta_seconds()
+        if eta is not None:
+            self._displayed_eta_seconds = eta
+            self._eta_last_update_accepted = self.accepted
+
+    def eta_seconds(self) -> Optional[float]:
+        """Displayed ETA (last 40 accepts, refreshed every 10 accepts).
+
+        Uses the span of the most recent accept window:
+        ``rate = (n_accepts - 1) / (t_last - t_first)``.
+        First appears at 10 accepts; returns 0 when complete.
+        """
+        if self.complete:
+            return 0.0
+        return self._displayed_eta_seconds
 
     def averages(self) -> Dict[int, np.ndarray]:
         if self.accepted < 1:
@@ -148,6 +228,7 @@ class InterferogramAverager:
             last_peak_corr=self.last_peak_corr,
             last_lag=self.last_lag,
             complete=self.complete,
+            eta_seconds=self.eta_seconds(),
             averages=self.averages(),
             x=None if self._x is None else self._x.copy(),
         )
@@ -205,6 +286,7 @@ class InterferogramAverager:
             self.accepted = 1
             self.last_peak_corr = 1.0
             self.last_lag = 0
+            self._record_accept()
             return self.snapshot()
 
         # Length must match the stack.
@@ -241,6 +323,7 @@ class InterferogramAverager:
                 # then add (rare; usually channel set is fixed at start).
                 self._sum[ch] = aligned * float(self.accepted) + aligned
         self.accepted += 1
+        self._record_accept()
         return self.snapshot()
 
 
