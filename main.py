@@ -53,6 +53,8 @@ from src.live_view import (
     normalize_live_window,
     max_capture_rate_to_interval_s,
     LIVE_DEPTH_INCREMENT,
+    LIVE_TRIGGER_TIMEOUT,
+    AVERAGE_TRIGGER_TIMEOUT,
 )
 from src.averaging import (
     AverageResult,
@@ -304,9 +306,9 @@ class ifmstate:
     average_result: AverageResult | None = None
     ignore_start_until = 0.0
 
-# If the Gage child stops delivering frames this long, force a restart.
-# Keep this well above normal trigger gaps so we do not re-Commit (and click
-# the board relay) during ordinary quiet periods between interferograms.
+# If the Gage child is silent this long (no frames AND no heartbeat), recycle
+# it. Heartbeats fire while waiting for a trigger or sitting in analog
+# calibration (relay clicking), so ordinary pauses must not re-Commit.
 CAPTURE_STALL_TIMEOUT_S = 30.0
 
 ifm = ifmstate()
@@ -694,6 +696,9 @@ def _start_capture_engine(
         + ("" if ifm.has_gage else " (simulated)")
     )
     try:
+        trigger_timeout = (
+            AVERAGE_TRIGGER_TIMEOUT if average else LIVE_TRIGGER_TIMEOUT
+        )
         ifm.live_engine.configure(
             ifm.samplerate,
             channels,
@@ -702,6 +707,7 @@ def _start_capture_engine(
             post_trigger_samples=post,
             trigger=trigger,
             max_capture_rate_hz=ifm.max_capture_rate_hz,
+            trigger_timeout=trigger_timeout,
         )
         ifm.live_engine.start(
             channels,
@@ -1370,12 +1376,38 @@ def refresh_spectrum_from_cache():
         update_spectrum_plot(ifm.last_spectrum_y)
 
 
+def _engine_progress_time(engine) -> float:
+    """Latest of a real frame or a child heartbeat (wait/calib)."""
+    hb = float(getattr(engine, "last_heartbeat", 0.0) or 0.0)
+    return max(float(ifm.live_last_frame or 0.0), hb)
+
+
 def _restart_stalled_capture(engine, channels, label: str) -> None:
-    """Recycle the capture engine after a no-frame stall."""
-    stalled_for = time.monotonic() - ifm.live_last_frame
-    print(
-        f"{label}: no frames for {stalled_for:.1f}s; restarting capture..."
-    )
+    """Recycle the capture engine only when the child is dead or hung.
+
+    Analog calibration and long waits between interferograms send heartbeats
+    without frames. Killing the child there re-Commits the Razor and clicks
+    the input relays, and wipes the running average.
+    """
+    last = _engine_progress_time(engine)
+    stalled_for = time.monotonic() - last if last > 0.0 else 0.0
+    alive = True
+    child_alive = getattr(engine, "child_alive", None)
+    if callable(child_alive):
+        alive = bool(child_alive())
+    phase = str(getattr(engine, "board_phase", "") or "")
+    if alive and stalled_for < CAPTURE_STALL_TIMEOUT_S:
+        return
+    if alive:
+        print(
+            f"{label}: child hung "
+            f"({stalled_for:.1f}s silent, phase={phase or 'unknown'}); "
+            f"recycling Gage process..."
+        )
+    else:
+        print(
+            f"{label}: Gage child exited; restarting capture..."
+        )
     engine.restart_capture(channels)
     ifm.live_last_frame = time.monotonic()
 
@@ -1396,16 +1428,17 @@ def live_view_tick():
         return
 
     try:
-        if (
-            ifm.live_last_frame > 0.0
-            and (now - ifm.live_last_frame) > CAPTURE_STALL_TIMEOUT_S
-        ):
+        progress = _engine_progress_time(engine)
+        if progress > 0.0 and (now - progress) > CAPTURE_STALL_TIMEOUT_S:
             _restart_stalled_capture(engine, channels, "Live View")
             return
 
         data = engine.capture(channels)
         if data is not None:
             ifm.live_last_frame = time.monotonic()
+        hb = float(getattr(engine, "last_heartbeat", 0.0) or 0.0)
+        if hb > ifm.live_last_frame:
+            ifm.live_last_frame = hb
         take = getattr(engine, "take_spectrum", None)
         spec = take() if callable(take) else None
         newer = getattr(engine, "full_traces_if_newer", lambda: None)()
@@ -1445,10 +1478,8 @@ def average_tick():
         return
 
     try:
-        if (
-            ifm.live_last_frame > 0.0
-            and (now - ifm.live_last_frame) > CAPTURE_STALL_TIMEOUT_S
-        ):
+        progress = _engine_progress_time(engine)
+        if progress > 0.0 and (now - progress) > CAPTURE_STALL_TIMEOUT_S:
             _restart_stalled_capture(engine, channels, "Average mode")
             status = getattr(engine, "average_status", lambda: None)()
             if status is not None:
@@ -1457,6 +1488,9 @@ def average_tick():
             return
 
         data = engine.capture(channels)
+        hb = float(getattr(engine, "last_heartbeat", 0.0) or 0.0)
+        if hb > ifm.live_last_frame:
+            ifm.live_last_frame = hb
         status = getattr(engine, "average_status", lambda: None)()
         if status is not None:
             prev = ifm.average_result

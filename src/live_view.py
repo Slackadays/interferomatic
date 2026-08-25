@@ -24,6 +24,19 @@ overlap CsTestQt / LabVIEW use to hide host work inside acquisition time.
 The comb-aligned FFT is **not** on this path. Full traces are written to
 shared memory; a background thread in the UI process transforms them on
 its own clock so a 2–4 MSa rFFT cannot stall the next shot.
+
+Relay-click pauses
+------------------
+Commit, Abort, and on-board calibration all toggle the Razor analog
+front-end relays. The capture loop therefore:
+
+* waits through ``ACQ_STATUS_BUSY_CALIB`` without Abort/Force/Commit
+* uses a 2 s hardware trigger timeout while averaging (long vs Δf_rep,
+  short vs a WAIT_TRIGGER that hides calibration on Linux)
+* heartbeats while waiting so the UI does not recycle the child (which
+  would re-Commit and wipe the running average)
+* prefers a C shim (``libgage_acq.so``) that polls at 10 ms like CsTestQt
+  instead of 100 µs GetStatus from Python
 """
 
 from __future__ import annotations
@@ -39,12 +52,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
 import numpy as np
 
+from src.average_shm import SharedAverageBuffer
 from src.averaging import (
     AverageResult,
     InterferogramAverager,
     downsample_minmax,
 )
 from src.config import MAX_LIVE_SAMPLES
+from src.gage_shim import (
+    ACQ_STATUS_BUSY_CALIB,
+    ACQ_STATUS_READY,
+    CALIB_TIMEOUT_S,
+    RESULT_READY,
+    RESULT_STOPPED,
+    WAIT_SLICE_S,
+    GageAcq,
+    board_is_calibrating,
+    can_start_capture,
+    status_name,
+)
 from src.spectrum import compute_rf_spectrum
 from src.trace_shm import SharedTraceBuffer
 
@@ -142,16 +168,28 @@ def _format_trigger_summary(trigger: TriggerSettings, trig_source: int) -> str:
     edge = "rising" if trigger["edge"] == "Rising" else "falling"
     return f"{src} {edge}@{trigger['level']}%"
 
-# Acquisition trigger timeout (100 ns units). Used as a safety net when the
-# channel edge never arrives (quiet input) so Live View still refreshes.
-# 100 ms = 1_000_000 * 100 ns.
+# Acquisition trigger timeout (100 ns units). 100 ms = 1_000_000 * 100 ns.
+# Monitor: short timeout so Live View still refreshes on a quiet input.
+# Average: a few seconds — long vs Δf_rep (~22 ms at 45.84 Hz) so real
+# interferograms always win, short vs a stuck WAIT_TRIGGER. On Linux,
+# CsGetStatus while the SSM is in WAIT_TRIGGER never reports BUSY_CALIB,
+# so an infinite timeout hangs the run the next time the analog front-end
+# calibrates (relay click, typically after a few minutes).
 LIVE_TRIGGER_TIMEOUT = 1_000_000
+AVERAGE_TRIGGER_TIMEOUT = 20_000_000  # 2 s
 
+# If the hardware timeout did not produce READY, Force once, then give up
+# this shot. ACTION_FORCE does not click relays; Abort/Commit do. Forced
+# records are rejected by the correlator (low r).
 CAPTURE_WAIT_TIMEOUT_S = 2.0
-STATUS_POLL_INTERVAL_S = 0.0001
+AVERAGE_WAIT_TIMEOUT_S = 3.0
+STATUS_POLL_INTERVAL_S = 0.01
 # Fallback minimum time between capture attempts when no max rate is configured.
 WORKER_MIN_FRAME_INTERVAL_S = 0.0
-POST_COMMIT_READY_TIMEOUT_S = 30.0
+# Commit runs on-board calibration (relay sequence). CsTestQt ForceCalib
+# sleeps 10 s; wait a full minute before declaring the board stuck.
+POST_COMMIT_READY_TIMEOUT_S = 60.0
+HEARTBEAT_INTERVAL_S = 0.5
 
 
 def max_capture_rate_to_interval_s(max_hz: int) -> float:
@@ -312,6 +350,8 @@ def normalize_live_window(
 def _mode_for_channels(enabled: Sequence[int]) -> int:
     import GageConstants as gc
 
+    # CSE1642 rejects CS_MODE_POWER_ON (CS_INVALID_ACQ_MODE). Analog-frontend
+    # power-save pauses are handled by waiting through BUSY_CALIB instead.
     if not enabled:
         return gc.CS_MODE_SINGLE
     highest = max(enabled)
@@ -350,54 +390,114 @@ def raw_to_volts(buffer, acq: dict, chan: dict) -> np.ndarray:
     return ((sample_offset - samples) / np.float32(sample_res)) * scale + offset
 
 
-def _child_abort(handle) -> None:
-    import PyGage
-
+def _child_abort(acq: GageAcq, handle) -> None:
     try:
-        PyGage.AbortCapture(handle)
+        acq.abort(handle)
     except Exception:
         pass
 
 
+class CaptureStopped(RuntimeError):
+    """Raised when the user (or parent) asks the child to halt."""
+
+
+def _stopped(stop_event, halt_event) -> bool:
+    if stop_event is not None and stop_event.is_set():
+        return True
+    if halt_event is not None and halt_event.is_set():
+        return True
+    return False
+
+
+def _pump_halt(cmd_q, halt_event, stop_event) -> None:
+    """Apply halt/stop even while blocked in a wait; requeue other commands."""
+    if cmd_q is None:
+        return
+    deferred = []
+    while True:
+        try:
+            cmd = cmd_q.get_nowait()
+        except Exception:
+            break
+        if not cmd:
+            continue
+        op = cmd[0]
+        if op == "halt":
+            if halt_event is not None:
+                halt_event.set()
+        elif op == "stop":
+            if stop_event is not None:
+                stop_event.set()
+            if halt_event is not None:
+                halt_event.set()
+        else:
+            deferred.append(cmd)
+    for cmd in deferred:
+        try:
+            cmd_q.put_nowait(cmd)
+        except Exception:
+            pass
+
+
 def _child_wait_ready(
+    acq: GageAcq,
     handle,
-    timeout_s: float,
+    timeout_s: Optional[float],
     stop_event: mp.synchronize.Event,
     halt_event: Optional[threading.Event] = None,
+    on_status: Optional[Any] = None,
+    cmd_q=None,
+    *,
+    allow_force: bool = False,
 ) -> None:
-    import PyGage
-    import GageConstants as gc
-
-    deadline = time.monotonic() + timeout_s
+    """Wait for READY. Calibration pauses the shot clock; no Abort here."""
     forced = False
-    while not stop_event.is_set():
-        if halt_event is not None and halt_event.is_set():
-            _child_abort(handle)
-            raise RuntimeError("stopped")
-        status = PyGage.GetStatus(handle)
-        if status < 0:
-            _child_abort(handle)
-            raise RuntimeError(PyGage.GetErrorString(status))
-        if status == gc.ACQ_STATUS_READY:
-            return
+    shot_t0 = time.monotonic()
+    calib_t0: Optional[float] = None
+
+    while True:
+        _pump_halt(cmd_q, halt_event, stop_event)
+        if _stopped(stop_event, halt_event):
+            _child_abort(acq, handle)
+            raise CaptureStopped("stopped")
         now = time.monotonic()
-        if now > deadline:
-            if not forced:
-                force = PyGage.ForceCapture(handle)
-                forced = True
-                if force < 0:
-                    _child_abort(handle)
-                    raise RuntimeError(
-                        f"Capture timed out ({PyGage.GetErrorString(force)})"
-                    )
-                deadline = now + timeout_s
-                time.sleep(STATUS_POLL_INTERVAL_S)
-                continue
-            _child_abort(handle)
-            raise RuntimeError("Capture timed out waiting for ACQ_STATUS_READY")
-        time.sleep(STATUS_POLL_INTERVAL_S)
-    _child_abort(handle)
-    raise RuntimeError("stopped")
+        st = acq.status(handle)
+        if st < 0:
+            raise RuntimeError(acq.error_string(st))
+        if on_status is not None:
+            on_status(st)
+        if st == ACQ_STATUS_READY:
+            return
+        if st == ACQ_STATUS_BUSY_CALIB:
+            if calib_t0 is None:
+                calib_t0 = now
+            elif now - calib_t0 >= CALIB_TIMEOUT_S:
+                raise TimeoutError("Timed out waiting for analog calibration")
+        else:
+            calib_t0 = None
+            if timeout_s is not None and now - shot_t0 >= timeout_s:
+                if allow_force and not forced:
+                    force = acq.force(handle)
+                    if force < 0:
+                        raise RuntimeError(acq.error_string(force))
+                    forced = True
+                    shot_t0 = time.monotonic()
+                    continue
+                raise TimeoutError("Capture timed out waiting for ACQ_STATUS_READY")
+        # Short slice so halt/stop can be noticed; do not pause this slice
+        # on calib (the outer loop already did).
+        result = acq.wait_ready(
+            handle,
+            WAIT_SLICE_S,
+            stop_check=lambda: _stopped(stop_event, halt_event),
+            on_status=on_status,
+            pause_on_calib=False,
+        )
+        if result == RESULT_READY:
+            return
+        if result == RESULT_STOPPED:
+            _child_abort(acq, handle)
+            raise CaptureStopped("stopped")
 
 
 def _apply_trigger_config(
@@ -471,14 +571,31 @@ def _child_configure(
     post_samples: int,
     app_config: dict,
     trigger: Optional[Dict[str, Any]] = None,
+    trigger_timeout: Optional[int] = None,
+    acq_backend: Optional[GageAcq] = None,
 ) -> List[int]:
     import PyGage
     import GageSupport as gs
     import GageConstants as gc
 
     trigger_settings = normalize_trigger_settings(trigger)
+    if trigger_timeout is None:
+        trigger_timeout = int(app_config.get("TriggerTimeout", LIVE_TRIGGER_TIMEOUT))
+    app_config["TriggerTimeout"] = int(trigger_timeout)
 
-    _child_abort(handle)
+    backend = acq_backend or GageAcq()
+    # Only Abort if a shot is in flight. Abort on an idle board is what
+    # clicks the Razor input relays between otherwise-identical Commits.
+    try:
+        st = backend.status(handle)
+        if board_is_calibrating(st):
+            backend.wait_ready(handle, CALIB_TIMEOUT_S)
+            st = backend.status(handle)
+        if not can_start_capture(st) and st >= 0:
+            backend.abort_and_settle(handle)
+            backend.wait_ready(handle, POST_COMMIT_READY_TIMEOUT_S)
+    except Exception:
+        pass
 
     # Align to the board's depth resolution (CSE1642 → 32).
     depth_inc = _DEFAULT_DEPTH_INCREMENT
@@ -509,7 +626,12 @@ def _child_configure(
     mode = _mode_for_channels(enabled)
     acq["Mode"] = mode
     acq["SampleRate"] = int(sample_rate)
-    acq["TriggerTimeout"] = LIVE_TRIGGER_TIMEOUT
+    trigger_timeout = app_config.get("TriggerTimeout", LIVE_TRIGGER_TIMEOUT)
+    try:
+        trigger_timeout = int(trigger_timeout)
+    except (TypeError, ValueError):
+        trigger_timeout = LIVE_TRIGGER_TIMEOUT
+    acq["TriggerTimeout"] = trigger_timeout
     acq["SegmentCount"] = 1
     # Post-trigger depth; SegmentSize holds pre + post so pre-trigger is available.
     # Both must be multiples of CAPS_DEPTH_INCREMENT or Commit returns
@@ -543,15 +665,11 @@ def _child_configure(
     if status < 0:
         raise RuntimeError(PyGage.GetErrorString(status))
 
-    deadline = time.monotonic() + POST_COMMIT_READY_TIMEOUT_S
-    while time.monotonic() < deadline:
-        st = PyGage.GetStatus(handle)
-        if st < 0:
-            raise RuntimeError(PyGage.GetErrorString(st))
-        if st == gc.ACQ_STATUS_READY:
-            break
-        time.sleep(0.01)
-    else:
+    # Commit often runs a full analog calibration (relays click for seconds).
+    # Wait it out; Abort/Force here would click the relays again.
+    acq = GageAcq()
+    result = acq.wait_ready(handle, POST_COMMIT_READY_TIMEOUT_S)
+    if result != RESULT_READY:
         raise RuntimeError("Timed out waiting for board READY after Commit")
 
     # Re-read the committed config once. Transfer uses this cache every frame
@@ -580,7 +698,11 @@ def _child_configure(
 
 
 def _child_transfer(
-    handle, app_config: dict, channels: Sequence[int], segment: int = 1
+    handle,
+    app_config: dict,
+    channels: Sequence[int],
+    acq_backend: GageAcq,
+    segment: int = 1,
 ) -> ChannelData:
     import PyGage
     import GageConstants as gc
@@ -605,14 +727,14 @@ def _child_transfer(
     x_axis = app_config.get("XAxis")
     result: ChannelData = {}
     for ch in channels:
-        transferred = PyGage.TransferData(
-            handle, ch, gc.TxMODE_DEFAULT, int(segment), start, length
+        buf, actual_start, actual_length = acq_backend.transfer(
+            handle,
+            int(ch),
+            start,
+            length,
+            mode=gc.TxMODE_DEFAULT,
+            segment=int(segment),
         )
-        if isinstance(transferred, int):
-            raise RuntimeError(
-                f"Transfer channel {ch}: {PyGage.GetErrorString(transferred)}"
-            )
-        buf, actual_start, actual_length = transferred
         chan = chan_cache.get(int(ch))
         if not isinstance(chan, dict):
             chan = PyGage.GetChannelConfig(handle, ch)
@@ -637,41 +759,57 @@ def _child_transfer(
 
 
 def _child_arm_capture(
+    acq: GageAcq,
     handle,
     stop_event: mp.synchronize.Event,
     halt_event: Optional[threading.Event] = None,
 ) -> bool:
-    """Start a new acquisition. Returns False if the board is calibrating."""
-    import PyGage
-    import GageConstants as gc
+    """Start a new acquisition. Returns False if the board is busy/calibrating.
 
-    if stop_event.is_set() or (halt_event is not None and halt_event.is_set()):
+    Never Aborts: Abort on CSE1642 toggles the input relays. If a previous
+    shot or a calibration is still in flight, the caller waits it out.
+    """
+    if _stopped(stop_event, halt_event):
         return False
-    status = PyGage.GetStatus(handle)
+    status = acq.status(handle)
     if status < 0:
-        raise RuntimeError(PyGage.GetErrorString(status))
-    if status == gc.ACQ_STATUS_BUSY_CALIB:
+        raise RuntimeError(acq.error_string(status))
+    if not can_start_capture(status):
         return False
-    if status != gc.ACQ_STATUS_READY:
-        _child_abort(handle)
-        time.sleep(0.001)
 
-    status = PyGage.StartCapture(handle)
+    status = acq.start(handle)
     if status < 0:
-        raise RuntimeError(PyGage.GetErrorString(status))
+        raise RuntimeError(acq.error_string(status))
     return True
 
 
 def _child_finish_capture(
-    handle, app_config: dict, channels: Sequence[int],
+    acq: GageAcq,
+    handle,
+    app_config: dict,
+    channels: Sequence[int],
     stop_event: mp.synchronize.Event,
     halt_event: Optional[threading.Event] = None,
+    on_status: Optional[Any] = None,
+    cmd_q=None,
+    *,
+    allow_force: bool = False,
+    timeout_s: Optional[float] = CAPTURE_WAIT_TIMEOUT_S,
 ) -> Optional[ChannelData]:
     """Wait for the armed acquisition and DMA the record to host memory."""
-    _child_wait_ready(handle, CAPTURE_WAIT_TIMEOUT_S, stop_event, halt_event)
-    if stop_event.is_set():
+    _child_wait_ready(
+        acq,
+        handle,
+        timeout_s,
+        stop_event,
+        halt_event,
+        on_status,
+        cmd_q,
+        allow_force=allow_force,
+    )
+    if _stopped(stop_event, halt_event):
         return None
-    return _child_transfer(handle, app_config, channels)
+    return _child_transfer(handle, app_config, channels, acq)
 
 
 def _live_view_child_main(
@@ -691,6 +829,7 @@ def _live_view_child_main(
     import PyGage
     import GageSupport as gs
 
+    board = GageAcq()
     handle = None
     system_info = None
     app_config = None
@@ -700,8 +839,10 @@ def _live_view_child_main(
     frames_since_reset = 0
     min_frame_interval_s = WORKER_MIN_FRAME_INTERVAL_S
     # Last successful configure:
-    # (rate, enabled, range_mv, pre, post, max_hz, trigger_settings_dict).
-    last_config: Optional[Tuple[int, List[int], int, int, int, int, dict]] = None
+    # (rate, enabled, range_mv, pre, post, max_hz, trigger_settings, timeout).
+    last_config: Optional[Tuple[int, List[int], int, int, int, int, dict, int]] = None
+    wait_timeout_s: Optional[float] = CAPTURE_WAIT_TIMEOUT_S
+    allow_force = True
     averager: Optional[InterferogramAverager] = None
     spectrum_params: Optional[dict] = None
     last_plot_t = 0.0
@@ -712,12 +853,45 @@ def _live_view_child_main(
     fft_thread: Optional[threading.Thread] = None
     halt_event = threading.Event()
     shm: Optional[SharedTraceBuffer] = None
+    avg_shm: Optional[SharedAverageBuffer] = None
+    last_avg_ckpt = 0.0
+    last_avg_ckpt_accepted = -1
     if shm_name:
         try:
             shm = SharedTraceBuffer(MAX_LIVE_SAMPLES, name=shm_name, create=False)
         except Exception as exc:
             print(f"Gage child: shared traces unavailable ({exc})")
             shm = None
+
+    def checkpoint_average(force: bool = False) -> None:
+        nonlocal last_avg_ckpt, last_avg_ckpt_accepted
+        if avg_shm is None or averager is None or averager.accepted < 1:
+            return
+        now_ckpt = time.monotonic()
+        if not force and now_ckpt - last_avg_ckpt < 0.25:
+            return
+        state = averager.checkpoint_dict()
+        if not state:
+            return
+        try:
+            avg_shm.write(
+                accepted=state["accepted"],
+                rejected=state["rejected"],
+                target=state["target"],
+                threshold=state["threshold"],
+                last_peak_corr=state["last_peak_corr"],
+                last_lag=state["last_lag"],
+                reference_channel=state["reference_channel"],
+                align_center=state["align_center"],
+                align_window=state["align_window"],
+                x0=state["x0"],
+                sums=state["sums"],
+                eta_seconds=state["eta_seconds"],
+            )
+            last_avg_ckpt = now_ckpt
+            last_avg_ckpt_accepted = int(state["accepted"])
+        except Exception as exc:
+            print(f"Gage child: average checkpoint failed ({exc})")
 
     def emit(kind: str, payload=None) -> None:
         try:
@@ -744,6 +918,15 @@ def _live_view_child_main(
         return None
 
     def fft_loop() -> None:
+        # HWEventHandler is not async-signal-safe. Keep Gage RT signals on
+        # the capture thread so an rFFT cannot SIGSEGV the child mid-run.
+        try:
+            import signal as _signal
+            lo = int(getattr(_signal, "SIGRTMIN", 34))
+            hi = int(getattr(_signal, "SIGRTMAX", 64))
+            _signal.pthread_sigmask(_signal.SIG_BLOCK, range(lo, hi + 1))
+        except Exception:
+            pass
         while not fft_stop.is_set() and not stop_event.is_set():
             if spectrum_params is None or sample_rate_hz <= 0:
                 if fft_stop.wait(0.05):
@@ -779,11 +962,64 @@ def _live_view_child_main(
             fft_thread.join(timeout=1.5)
         fft_thread = None
 
+    last_hb = 0.0
+    last_phase: Optional[str] = None
+
+    def on_board_status(st: int) -> None:
+        nonlocal last_hb, last_phase
+        now_hb = time.monotonic()
+        phase = status_name(st)
+        if phase != last_phase:
+            if st == ACQ_STATUS_BUSY_CALIB:
+                print(
+                    "Gage: analog calibration (relay sequence) — "
+                    "waiting, not aborting"
+                )
+            last_phase = phase
+            emit("heartbeat", {"status": phase})
+            last_hb = now_hb
+        elif now_hb - last_hb >= HEARTBEAT_INTERVAL_S:
+            emit("heartbeat", {"status": phase})
+            last_hb = now_hb
+
+    def recover_soft(reason: str) -> bool:
+        """Get back to READY without Commit/FreeSystem (no extra relay clicks)."""
+        print(f"Gage: soft recover ({reason}) — wait READY, no re-Commit")
+        if handle is None:
+            return False
+        try:
+            st = board.status(handle)
+            if st < 0:
+                print(f"Gage: handle/status error {board.error_string(st)}")
+                return False
+            if st == ACQ_STATUS_READY:
+                return True
+            if board_is_calibrating(st) or not can_start_capture(st):
+                result = board.wait_ready(
+                    handle,
+                    POST_COMMIT_READY_TIMEOUT_S,
+                    stop_check=lambda: _stopped(stop_event, halt_event),
+                    on_status=on_board_status,
+                )
+                if result == RESULT_READY:
+                    return True
+            board.abort_and_settle(handle)
+            result = board.wait_ready(
+                handle,
+                POST_COMMIT_READY_TIMEOUT_S,
+                stop_check=lambda: _stopped(stop_event, halt_event),
+                on_status=on_board_status,
+            )
+            return result == RESULT_READY
+        except Exception as exc:
+            print(f"Gage: soft recover failed ({exc})")
+            return False
+
     def open_board() -> None:
         nonlocal handle, system_info, app_config
         if handle is not None:
             try:
-                _child_abort(handle)
+                board.abort_and_settle(handle)
             except Exception:
                 pass
             try:
@@ -832,7 +1068,12 @@ def _live_view_child_main(
             {
                 "BoardName": system_info.get("BoardName"),
                 "ChannelCount": system_info.get("ChannelCount"),
+                "c_shim": board.using_c_shim,
             },
+        )
+        print(
+            "Gage capture backend: "
+            + ("C shim (CsDo/CsTransfer)" if board.using_c_shim else "PyGage fallback")
         )
 
         while not stop_event.is_set():
@@ -850,7 +1091,7 @@ def _live_view_child_main(
                 if op == "stop":
                     break
                 if op == "configure":
-                    # (op, rate, enabled, range_mv, pre, post, max_hz, trigger_dict)
+                    # (op, rate, enabled, range_mv, pre, post, max_hz, trigger, timeout)
                     sample_rate = cmd[1]
                     enabled = cmd[2]
                     range_mv = cmd[3]
@@ -858,6 +1099,7 @@ def _live_view_child_main(
                     post_samples = cmd[5]
                     max_hz_in = cmd[6] if len(cmd) > 6 else 0
                     trigger_in = cmd[7] if len(cmd) > 7 else None
+                    timeout_in = cmd[8] if len(cmd) > 8 else LIVE_TRIGGER_TIMEOUT
                     try:
                         capturing = False
                         pending_frame = None
@@ -869,6 +1111,10 @@ def _live_view_child_main(
                         cfg_range = int(range_mv)
                         cfg_pre = int(pre_samples)
                         cfg_post = int(post_samples)
+                        try:
+                            cfg_timeout = int(timeout_in)
+                        except (TypeError, ValueError):
+                            cfg_timeout = LIVE_TRIGGER_TIMEOUT
                         last_config = (
                             cfg_rate,
                             cfg_enabled,
@@ -877,6 +1123,7 @@ def _live_view_child_main(
                             cfg_post,
                             max_hz,
                             dict(trig_settings),
+                            cfg_timeout,
                         )
                         active_channels = _child_configure(
                             handle,
@@ -889,6 +1136,8 @@ def _live_view_child_main(
                             cfg_post,
                             app_config,
                             trigger=last_config[6],
+                            trigger_timeout=cfg_timeout,
+                            acq_backend=board,
                         )
                         channels = list(active_channels)
                         frames_since_reset = 0
@@ -926,6 +1175,15 @@ def _live_view_child_main(
                         active_channels[:1]
                     )
                     spectrum_params = dict(spec_in) if isinstance(spec_in, dict) else None
+                    avg_shm_name = cmd[4] if len(cmd) > 4 else None
+                    if avg_shm is None and avg_shm_name:
+                        try:
+                            avg_shm = SharedAverageBuffer(
+                                MAX_LIVE_SAMPLES, name=str(avg_shm_name), create=False
+                            )
+                        except Exception as exc:
+                            print(f"Gage child: average checkpoint unavailable ({exc})")
+                            avg_shm = None
                     if isinstance(avg_in, dict) and avg_in:
                         ref_ch = avg_in.get("reference_channel")
                         try:
@@ -937,8 +1195,35 @@ def _live_view_child_main(
                             threshold=float(avg_in.get("threshold", 0.5)),
                             reference_channel=ref_ch,
                         )
+                        restored = False
+                        if avg_shm is not None:
+                            try:
+                                ckpt = avg_shm.read()
+                            except Exception:
+                                ckpt = None
+                            if ckpt is not None:
+                                restored = averager.load_checkpoint(ckpt)
+                        if restored:
+                            print(
+                                f"Gage: restored average stack "
+                                f"{averager.accepted}/{averager.target} "
+                                f"({averager.rejected} rejected)"
+                            )
+                            emit("heartbeat", {"status": "restored"})
+                            emit(
+                                "average_result",
+                                averager.snapshot(include_arrays=False),
+                            )
                     else:
                         averager = None
+                    # Finite wait + ForceCapture watchdog. Infinite wait hangs
+                    # the first time the SSM stays in WAIT_TRIGGER through a
+                    # front-end calibration (Linux GetStatus hides BUSY_CALIB).
+                    if averager is not None:
+                        wait_timeout_s = AVERAGE_WAIT_TIMEOUT_S
+                    else:
+                        wait_timeout_s = CAPTURE_WAIT_TIMEOUT_S
+                    allow_force = True
                     last_plot_t = 0.0
                     halt_event.clear()
                     capturing = True
@@ -947,10 +1232,12 @@ def _live_view_child_main(
                     capturing = False
                     halt_event.set()
                     stop_fft_thread()
-                    _child_abort(handle)
+                    if handle is not None:
+                        board.abort_and_settle(handle)
                     if pending_frame is not None and averager is not None:
                         averager.process_frame(pending_frame)
                         pending_frame = None
+                    checkpoint_average(force=True)
                 elif op == "get_average":
                     if averager is not None:
                         emit(
@@ -977,8 +1264,7 @@ def _live_view_child_main(
                     SOFT_RESET_EVERY_N_FRAMES > 0
                     and frames_since_reset >= SOFT_RESET_EVERY_N_FRAMES
                 ):
-                    _child_abort(handle)
-                    time.sleep(0.002)
+                    board.abort_and_settle(handle)
                     frames_since_reset = 0
 
                 avg_lite = None
@@ -991,6 +1277,7 @@ def _live_view_child_main(
 
                 if averager is not None:
                     result = averager.process_frame(frame)
+                    checkpoint_average(force=result.complete)
                     avg_lite = _lite_average_dict(result)
                     if result.complete:
                         capturing = False
@@ -1044,22 +1331,78 @@ def _live_view_child_main(
             try:
                 # Arm the next shot first so alignment of the previous record
                 # overlaps the board's sample window (LabVIEW / CsTestQt style).
-                armed = _child_arm_capture(handle, stop_event, halt_event)
-                if armed:
-                    if pending_frame is not None:
-                        consume_frame(pending_frame)
-                        pending_frame = None
-                    if capturing and not stop_event.is_set():
-                        pending_frame = _child_finish_capture(
-                            handle, app_config, channels, stop_event, halt_event
+                armed = _child_arm_capture(
+                    board, handle, stop_event, halt_event
+                )
+                if not armed:
+                    # Calibrating or previous shot still running — wait, do
+                    # not Abort (Abort clicks the Razor relays).
+                    try:
+                        _child_wait_ready(
+                            board,
+                            handle,
+                            WAIT_SLICE_S,
+                            stop_event,
+                            halt_event,
+                            on_board_status,
+                            cmd_q,
+                            allow_force=False,
                         )
-                    else:
-                        _child_abort(handle)
+                    except TimeoutError:
+                        pass
+                    continue
+                if pending_frame is not None:
+                    consume_frame(pending_frame)
+                    pending_frame = None
+                if capturing and not stop_event.is_set():
+                    try:
+                        pending_frame = _child_finish_capture(
+                            board,
+                            handle,
+                            app_config,
+                            channels,
+                            stop_event,
+                            halt_event,
+                            on_board_status,
+                            cmd_q,
+                            allow_force=allow_force,
+                            timeout_s=wait_timeout_s,
+                        )
+                    except TimeoutError:
+                        # Quiet input, missed trigger, or SSM stuck in
+                        # WAIT_TRIGGER through a hidden calibration.
+                        pending_frame = None
+                        st = board.status(handle)
+                        on_board_status(st)
+                        if (
+                            st >= 0
+                            and not can_start_capture(st)
+                            and not board_is_calibrating(st)
+                        ):
+                            print(
+                                "Gage: acquisition watchdog — Abort to re-arm "
+                                "(no re-Commit)"
+                            )
+                            board.abort_and_settle(handle)
+                        continue
+                else:
+                    board.abort_and_settle(handle)
+            except CaptureStopped:
+                pending_frame = None
+                capturing = False
+                halt_event.set()
+                stop_fft_thread()
+                continue
             except Exception as e:
                 pending_frame = None
                 if stop_event.is_set() or "stopped" in str(e).lower():
-                    break
-                # Recover by re-opening the board and re-applying config once.
+                    capturing = False
+                    continue
+                # Soft recover first: wait through calib / drain in-flight
+                # shot. Re-Commit (relay click) only if the handle is dead.
+                if recover_soft(str(e)):
+                    frames_since_reset = 0
+                    continue
                 try:
                     open_board()
                     if last_config is not None:
@@ -1071,7 +1414,11 @@ def _live_view_child_main(
                             cfg_post,
                             cfg_max_hz,
                             cfg_trigger,
+                            *rest,
                         ) = last_config
+                        cfg_timeout = (
+                            int(rest[0]) if rest else LIVE_TRIGGER_TIMEOUT
+                        )
                         active_channels = _child_configure(
                             handle,
                             system_info,
@@ -1083,6 +1430,8 @@ def _live_view_child_main(
                             cfg_post,
                             app_config,
                             trigger=cfg_trigger,
+                            trigger_timeout=cfg_timeout,
+                            acq_backend=board,
                         )
                         min_frame_interval_s = max_capture_rate_to_interval_s(
                             int(cfg_max_hz)
@@ -1108,7 +1457,7 @@ def _live_view_child_main(
     finally:
         if handle is not None:
             try:
-                _child_abort(handle)
+                board.abort(handle)
             except Exception:
                 pass
             try:
@@ -1119,6 +1468,12 @@ def _live_view_child_main(
         if shm is not None:
             try:
                 shm.close(unlink=False)
+            except Exception:
+                pass
+        if avg_shm is not None:
+            try:
+                checkpoint_average(force=True)
+                avg_shm.close(unlink=False)
             except Exception:
                 pass
         emit("exited", None)
@@ -1144,12 +1499,15 @@ class LiveViewEngine:
         self._configured_post: Optional[int] = None
         self._configured_max_hz: Optional[int] = None
         self._configured_trigger: Optional[Tuple] = None
+        self._configured_trigger_timeout: Optional[int] = None
         self._running = False
         self._child_restarts = 0
         self._board_name = "Gage"
-        # (rate, channels, range_mv, pre, post, max_hz, trigger_key, trigger_dict)
+        self._last_heartbeat = 0.0
+        self._board_phase = ""
+        # (rate, channels, range_mv, pre, post, max_hz, trigger_key, trigger_dict, timeout)
         self._pending_config: Optional[
-            Tuple[int, Tuple[int, ...], int, int, int, int, Tuple, dict]
+            Tuple[int, Tuple[int, ...], int, int, int, int, Tuple, dict, int]
         ] = None
         self._last_error: Optional[str] = None
         self._config_ack = False
@@ -1162,12 +1520,24 @@ class LiveViewEngine:
         self._start_average: Optional[dict] = None
         self._start_spectrum: Optional[dict] = None
         self._shm: Optional[SharedTraceBuffer] = None
+        self._avg_shm: Optional[SharedAverageBuffer] = None
         self._spectrum_consumed: Optional[SpectrumData] = None
         self._traces_seq = -1
 
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def last_heartbeat(self) -> float:
+        return self._last_heartbeat
+
+    @property
+    def board_phase(self) -> str:
+        return self._board_phase
+
+    def child_alive(self) -> bool:
+        return self._proc is not None and self._proc.is_alive()
 
     def open(self) -> None:
         """Start the Gage child process (does not begin capturing yet)."""
@@ -1275,6 +1645,12 @@ class LiveViewEngine:
             except Exception:
                 pass
             self._shm = None
+        if self._avg_shm is not None:
+            try:
+                self._avg_shm.close(unlink=True)
+            except Exception:
+                pass
+            self._avg_shm = None
         self._configured_rate = None
         self._configured_channels = None
         self._configured_input_range = None
@@ -1282,6 +1658,7 @@ class LiveViewEngine:
         self._configured_post = None
         self._configured_max_hz = None
         self._configured_trigger = None
+        self._configured_trigger_timeout = None
 
     def stop(self) -> None:
         """Halt capture but keep the child (and board handle) alive."""
@@ -1309,6 +1686,7 @@ class LiveViewEngine:
             channels,
             average=self._start_average,
             spectrum=self._start_spectrum,
+            resume_average=True,
         )
 
     def _drain_events(self) -> None:
@@ -1321,8 +1699,11 @@ class LiveViewEngine:
                 break
             if kind == "ready":
                 self._available = True
+                self._last_heartbeat = time.monotonic()
                 if isinstance(payload, dict):
                     self._board_name = str(payload.get("BoardName") or "Gage")
+                    if payload.get("c_shim"):
+                        print("Gage child: using C acquisition shim")
             elif kind == "configured":
                 self._config_ack = True
                 if isinstance(payload, dict):
@@ -1354,6 +1735,10 @@ class LiveViewEngine:
                 self._last_error = str(payload)
             elif kind == "exited":
                 self._available = False
+            elif kind == "heartbeat":
+                self._last_heartbeat = time.monotonic()
+                if isinstance(payload, dict):
+                    self._board_phase = str(payload.get("status") or "")
             elif kind == "spectrum":
                 if isinstance(payload, dict) and payload.get("mag") is not None:
                     self._last_spectrum = payload
@@ -1412,6 +1797,7 @@ class LiveViewEngine:
                 max_hz,
                 _trig_key,
                 trig_dict,
+                trig_timeout,
             ) = self._pending_config
             self._send(
                 (
@@ -1423,6 +1809,7 @@ class LiveViewEngine:
                     post,
                     max_hz,
                     trig_dict,
+                    trig_timeout,
                 )
             )
             # Wait for configure ack / error briefly.
@@ -1444,15 +1831,14 @@ class LiveViewEngine:
             self._configured_post = post
             self._configured_max_hz = max_hz
             self._configured_trigger = _trig_key
+            self._configured_trigger_timeout = trig_timeout
 
         if self._running and self._configured_channels is not None:
-            self._send(
-                (
-                    "start",
-                    list(self._configured_channels),
-                    self._start_average,
-                    self._start_spectrum,
-                )
+            self.start(
+                list(self._configured_channels),
+                average=self._start_average,
+                spectrum=self._start_spectrum,
+                resume_average=True,
             )
 
     def _send(self, cmd: tuple) -> None:
@@ -1469,6 +1855,7 @@ class LiveViewEngine:
         post_trigger_samples: int = 15000,
         trigger: Optional[Dict[str, Any]] = None,
         max_capture_rate_hz: int = 0,
+        trigger_timeout: Optional[int] = None,
     ) -> None:
         if not self._available and self._proc is None:
             raise RuntimeError("Gage system is not open")
@@ -1483,6 +1870,13 @@ class LiveViewEngine:
         trig_settings = normalize_trigger_settings(trigger)
         trig_key = trigger_settings_key(trig_settings)
         max_hz = max(0, int(max_capture_rate_hz))
+        if trigger_timeout is None:
+            trig_timeout = LIVE_TRIGGER_TIMEOUT
+        else:
+            try:
+                trig_timeout = int(trigger_timeout)
+            except (TypeError, ValueError):
+                trig_timeout = LIVE_TRIGGER_TIMEOUT
 
         key = (
             int(sample_rate),
@@ -1493,6 +1887,7 @@ class LiveViewEngine:
             max_hz,
             trig_key,
             dict(trig_settings),
+            trig_timeout,
         )
         self._pending_config = key
         if (
@@ -1503,6 +1898,7 @@ class LiveViewEngine:
             and post == self._configured_post
             and max_hz == self._configured_max_hz
             and trig_key == self._configured_trigger
+            and trig_timeout == self._configured_trigger_timeout
         ):
             return
 
@@ -1519,6 +1915,7 @@ class LiveViewEngine:
                 post,
                 max_hz,
                 dict(trig_settings),
+                trig_timeout,
             )
         )
 
@@ -1549,6 +1946,7 @@ class LiveViewEngine:
         self._configured_post = post
         self._configured_max_hz = max_hz
         self._configured_trigger = trig_key
+        self._configured_trigger_timeout = trig_timeout
         self._child_restarts = 0  # healthy configure resets restart budget
 
     def start(
@@ -1556,19 +1954,34 @@ class LiveViewEngine:
         enabled_channels: Sequence[int],
         average: Optional[dict] = None,
         spectrum: Optional[dict] = None,
+        resume_average: bool = False,
     ) -> None:
         enabled = [int(c) for c in enabled_channels if 1 <= int(c) <= 4] or [1]
         self._ensure_child()
         self._running = True
         self._start_average = dict(average) if average else None
         self._start_spectrum = dict(spectrum) if spectrum else None
-        if self._start_average:
+        if self._start_average and not resume_average:
+            self._clear_average_shm()
             self._average_status = None
             self._average_full = None
+        avg_name = None
+        if self._start_average:
+            n = int(self._configured_pre or 0) + int(self._configured_post or 0)
+            self._ensure_avg_shm(max(n, 1))
+            avg_name = self._avg_shm.name if self._avg_shm is not None else None
         self._spectrum_consumed = None
         self._traces_seq = -1
         self._last_spectrum = None
-        self._send(("start", enabled, self._start_average, self._start_spectrum))
+        self._send(
+            (
+                "start",
+                enabled,
+                self._start_average,
+                self._start_spectrum,
+                avg_name,
+            )
+        )
         self._last_sent_channels = tuple(enabled)
 
     def update_spectrum(self, spectrum: Optional[dict] = None) -> None:
@@ -1630,6 +2043,29 @@ class LiveViewEngine:
             print(f"Shared traces unavailable ({exc}); zoom will use decimated plots")
             self._shm = None
 
+    def _ensure_avg_shm(self, n_samples: int) -> None:
+        n = max(1, int(n_samples), int(self._configured_pre or 0) + int(self._configured_post or 0))
+        if self._avg_shm is not None:
+            if self._avg_shm.max_samples >= n:
+                return
+            try:
+                self._avg_shm.close(unlink=True)
+            except Exception:
+                pass
+            self._avg_shm = None
+        try:
+            self._avg_shm = SharedAverageBuffer(n, create=True)
+        except Exception as exc:
+            print(f"Average checkpoint unavailable ({exc}); child restart will drop the stack")
+            self._avg_shm = None
+
+    def _clear_average_shm(self) -> None:
+        if self._avg_shm is not None:
+            try:
+                self._avg_shm.clear()
+            except Exception:
+                pass
+
     def get_average_result(self, timeout_s: float = 1.0) -> Optional[AverageResult]:
         """Fetch the full-resolution average from the child (for save / final plot)."""
         if self._average_full is not None and self._average_full.averages:
@@ -1680,6 +2116,19 @@ class LiveViewEngine:
         if self._last_error:
             err = self._last_error
             self._last_error = None
+            print(f"Gage child error: {err}")
+            # Keep collecting: re-arm the child instead of tearing down the run.
+            if self._running and self._proc is not None and self._proc.is_alive():
+                try:
+                    self.start(
+                        enabled,
+                        average=self._start_average,
+                        spectrum=self._start_spectrum,
+                        resume_average=True,
+                    )
+                except Exception:
+                    pass
+                return None
             self._running = False
             raise RuntimeError(err)
 
@@ -1694,6 +2143,7 @@ class LiveViewEngine:
                     enabled,
                     average=self._start_average,
                     spectrum=self._start_spectrum,
+                    resume_average=True,
                 )
             return None
 
@@ -1762,6 +2212,17 @@ class SimulatedLiveViewEngine:
     def available(self) -> bool:
         return self._available
 
+    @property
+    def last_heartbeat(self) -> float:
+        return time.monotonic() if self._running else 0.0
+
+    @property
+    def board_phase(self) -> str:
+        return "ready" if self._running else ""
+
+    def child_alive(self) -> bool:
+        return True
+
     def open(self) -> None:
         self._available = True
         print("Gage-less Live View: using simulated waveforms")
@@ -1780,6 +2241,7 @@ class SimulatedLiveViewEngine:
         enabled_channels: Sequence[int],
         average: Optional[dict] = None,
         spectrum: Optional[dict] = None,
+        resume_average: bool = False,
     ) -> None:
         self._last_capture_t = 0.0
         self._last_spectrum_t = 0.0
@@ -1787,17 +2249,18 @@ class SimulatedLiveViewEngine:
         self._last_plot = None
         self._spectrum_params = dict(spectrum) if spectrum else None
         if isinstance(average, dict) and average:
-            ref_ch = average.get("reference_channel")
-            try:
-                ref_ch = int(ref_ch) if ref_ch is not None else None
-            except (TypeError, ValueError):
-                ref_ch = None
-            self._averager = InterferogramAverager(
-                target=int(average.get("target", 1)),
-                threshold=float(average.get("threshold", 0.5)),
-                reference_channel=ref_ch,
-            )
-            self._average_status = None
+            if not (resume_average and self._averager is not None):
+                ref_ch = average.get("reference_channel")
+                try:
+                    ref_ch = int(ref_ch) if ref_ch is not None else None
+                except (TypeError, ValueError):
+                    ref_ch = None
+                self._averager = InterferogramAverager(
+                    target=int(average.get("target", 1)),
+                    threshold=float(average.get("threshold", 0.5)),
+                    reference_channel=ref_ch,
+                )
+                self._average_status = None
         else:
             self._averager = None
         self._fft_dirty = True
@@ -1820,7 +2283,12 @@ class SimulatedLiveViewEngine:
                 "reference_channel": self._averager.reference_channel,
             }
         self.stop()
-        self.start(enabled_channels, average=avg, spectrum=self._spectrum_params)
+        self.start(
+            enabled_channels,
+            average=avg,
+            spectrum=self._spectrum_params,
+            resume_average=True,
+        )
 
     def configure(
         self,
@@ -1831,7 +2299,9 @@ class SimulatedLiveViewEngine:
         post_trigger_samples: int = 15000,
         trigger: Optional[Dict[str, Any]] = None,
         max_capture_rate_hz: int = 0,
+        trigger_timeout: Optional[int] = None,
     ) -> None:
+        del trigger_timeout
         enabled = sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4})
         self._active_channels = enabled or [1]
         self._configured_rate = int(sample_rate)

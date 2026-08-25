@@ -104,6 +104,26 @@ def test_slice_xy_keeps_every_sample_when_zoomed():
     assert ys.size == xs.size
 
 
+def test_checkpoint_roundtrip_keeps_stack():
+    n = 4096
+    ref = _burst(n, n // 2)
+    x = np.arange(n, dtype=np.float64)
+    avg = InterferogramAverager(target=50, threshold=0.5, reference_channel=1)
+    avg.process_frame({1: (x, ref)})
+    avg.process_frame({1: (x, np.roll(ref, 11))})
+    assert avg.accepted == 2
+    state = avg.checkpoint_dict()
+    assert state is not None
+    fresh = InterferogramAverager(target=50, threshold=0.5, reference_channel=1)
+    assert fresh.load_checkpoint(state)
+    assert fresh.accepted == 2
+    np.testing.assert_allclose(fresh.averages()[1], avg.averages()[1])
+    # New aligned frames still fold into the restored sum.
+    ok = fresh.process_frame({1: (x, np.roll(ref, -4))})
+    assert ok.accepted == 3
+    assert ok.last_peak_corr > 0.9
+
+
 def test_snapshot_lite_omits_arrays():
     n = 1024
     y = _burst(n, n // 2)

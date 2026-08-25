@@ -426,6 +426,99 @@ class InterferogramAverager:
             else self._x,
         )
 
+    def load_checkpoint(self, state: dict) -> bool:
+        """Restore a stack saved by ``checkpoint_dict``. Returns False if empty."""
+        try:
+            accepted = int(state.get("accepted", 0))
+            sums = state.get("sums") or {}
+            n = int(state.get("n") or 0)
+        except (TypeError, ValueError):
+            return False
+        if accepted < 1 or not sums or n < 2:
+            return False
+        loaded: Dict[int, np.ndarray] = {}
+        for ch, buf in sums.items():
+            y = np.ascontiguousarray(np.asarray(buf, dtype=np.float64).ravel())
+            if y.size < 2:
+                continue
+            if y.size != n:
+                y = y[:n] if y.size > n else np.pad(y, (0, n - y.size))
+            loaded[int(ch)] = y
+        if not loaded:
+            return False
+        x0 = float(state.get("x0", 0.0) or 0.0)
+        x = state.get("x")
+        if x is not None:
+            x_arr = np.ascontiguousarray(np.asarray(x, dtype=np.float64).ravel())
+            if x_arr.size != n:
+                x_arr = np.arange(n, dtype=np.float64) + x0
+        else:
+            x_arr = np.arange(n, dtype=np.float64) + x0
+        self.accepted = accepted
+        try:
+            self.rejected = int(state.get("rejected", 0))
+        except (TypeError, ValueError):
+            self.rejected = 0
+        self.last_peak_corr = float(state.get("last_peak_corr", 0.0) or 0.0)
+        try:
+            self.last_lag = int(state.get("last_lag", 0))
+        except (TypeError, ValueError):
+            self.last_lag = 0
+        ref = state.get("reference_channel")
+        try:
+            self.reference_channel = int(ref) if ref is not None else None
+        except (TypeError, ValueError):
+            pass
+        center = state.get("align_center")
+        try:
+            self._align_center = int(center) if center is not None else None
+        except (TypeError, ValueError):
+            self._align_center = None
+        aw = state.get("align_window")
+        try:
+            if aw is not None:
+                self.align_window = max(MIN_ALIGN_WINDOW, int(aw))
+        except (TypeError, ValueError):
+            pass
+        self._sum = loaded
+        self._x = x_arr
+        self._length = n
+        self._channels = tuple(sorted(loaded.keys()))
+        if self.reference_channel not in loaded:
+            self.reference_channel = self._channels[0]
+        if self._align_center is None:
+            self._align_center = int(np.argmax(np.abs(loaded[self.reference_channel])))
+        eta = state.get("eta_seconds")
+        try:
+            self._displayed_eta_seconds = (
+                float(eta) if eta is not None else None
+            )
+        except (TypeError, ValueError):
+            self._displayed_eta_seconds = None
+        self._accept_times.clear()
+        return True
+
+    def checkpoint_dict(self) -> Optional[dict]:
+        """Serializable stack for shared-memory checkpoints. None if empty."""
+        if self.accepted < 1 or not self._sum or self._x is None:
+            return None
+        n = int(self._length or self._x.size)
+        return {
+            "accepted": int(self.accepted),
+            "rejected": int(self.rejected),
+            "target": int(self.target),
+            "threshold": float(self.threshold),
+            "last_peak_corr": float(self.last_peak_corr),
+            "last_lag": int(self.last_lag),
+            "reference_channel": self.reference_channel,
+            "align_center": self._align_center,
+            "align_window": int(self.align_window),
+            "x0": float(self._x[0]) if self._x.size else 0.0,
+            "n": n,
+            "sums": {int(ch): buf for ch, buf in self._sum.items()},
+            "eta_seconds": self.eta_seconds(),
+        }
+
     def _coerce_trace(
         self, y: ArrayLike, n: int, dtype: np.dtype
     ) -> np.ndarray:
