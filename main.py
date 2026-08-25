@@ -10,6 +10,7 @@ from enum import Enum
 from src.config import (
     save_config,
     load_ui_settings,
+    default_ui_settings,
     AUTOSAVE_INTERVAL_S,
     BULK_UNITS,
     DEFAULT_PRE_TRIGGER_SAMPLES,
@@ -326,8 +327,8 @@ else:
     print("Running in Gage-less mode. PyGage module not found.")
 
 
-# Acquisition settings locked while gathering. Start/Stop, Fullscreen,
-# Change Scale, Exit, and the live plot stay usable.
+# Acquisition settings locked while gathering (including Reset to Default).
+# Start/Stop, Fullscreen, Change Scale, Exit, and the live plot stay usable.
 SETTINGS_WIDGETS = (
     "mode_combo",
     "sample_rate_dropdown",
@@ -360,6 +361,7 @@ SETTINGS_WIDGETS = (
     "m2_input",
     "m3_input",
     "spectrum_axis_combo",
+    "reset_defaults_button",
 )
 
 
@@ -443,6 +445,113 @@ def set_gathering_ui(gathering: bool):
         # clear the snapshot when leaving other modes.
         if ifm.mode != Mode.AVERAGE:
             ifm.average_result = None
+
+
+def apply_ui_settings_to_state(ui):
+    """Copy a load_ui_settings() dict onto ifm (in-memory app state)."""
+    ifm.save_file = ui["save_file"]
+    ifm.save_enabled = ui["save_enabled"]
+    ifm.save_format = ui["save_format"]
+    ifm.save_when = ui["save_when"]
+    ifm.mode = Mode[ui["mode"]]
+    ifm.samplerate = ui["samplerate"]
+    ifm.input_range = ui["input_range"]
+    ifm.pre_trigger_samples = ui["pre_trigger_samples"]
+    ifm.post_trigger_samples = ui["post_trigger_samples"]
+    ifm.max_capture_rate_hz = ui["max_capture_rate_hz"]
+    ifm.d_frep_hz = ui["d_frep_hz"]
+    ifm.frio_mhz = ui["frio_mhz"]
+    ifm.m1 = ui["m1"]
+    ifm.m2 = ui["m2"]
+    ifm.m3 = ui["m3"]
+    ifm.spectrum_axis = normalize_spectrum_axis(ui["spectrum_axis"])
+    ifm.apodization = normalize_apodization(ui["apodization"])
+    ifm.trigger_source = ui["trigger_source"]
+    ifm.trigger_edge = ui["trigger_edge"]
+    ifm.trigger_threshold = ui["trigger_threshold"]
+    ifm.ext_trigger_coupling = ui["ext_trigger_coupling"]
+    ifm.ext_trigger_input_range = ui["ext_trigger_input_range"]
+    ifm.ext_trigger_impedance = ui["ext_trigger_impedance"]
+    ifm.channel1 = ui["channel1"]
+    ifm.channel2 = ui["channel2"]
+    ifm.channel3 = ui["channel3"]
+    ifm.channel4 = ui["channel4"]
+    ifm.threshold = ui["threshold"]
+    ifm.interferograms_target = ui["interferograms"]
+
+
+def _set_widget_value(tag, value):
+    if dpg.does_item_exist(tag):
+        dpg.set_value(tag, value)
+
+
+def apply_ui_settings_to_widgets(ui):
+    """Push a settings dict into the main-window controls, if they exist."""
+    _set_widget_value("mode_combo", MODE_LABELS[Mode[ui["mode"]]])
+    _set_widget_value("interferograms_input", ui["interferograms"])
+    _set_widget_value("threshold_slider", ui["threshold"])
+    _set_widget_value("apodization_combo", ui["apodization"])
+    _set_widget_value("bulk_limit_input", ui["bulk_limit"])
+    _set_widget_value("bulk_unit_combo", ui["bulk_unit"])
+    _set_widget_value(
+        "sample_rate_dropdown", samplerate_to_label(ui["samplerate"])
+    )
+    _set_widget_value("channel1_checkbox", ui["channel1"])
+    _set_widget_value("channel2_checkbox", ui["channel2"])
+    _set_widget_value("channel3_checkbox", ui["channel3"])
+    _set_widget_value("channel4_checkbox", ui["channel4"])
+    _set_widget_value(
+        "input_range_dropdown", input_range_to_label(ui["input_range"])
+    )
+    _set_widget_value("max_capture_rate_input", ui["max_capture_rate_hz"])
+    _set_widget_value("pre_trigger_input", ui["pre_trigger_samples"])
+    _set_widget_value("post_trigger_input", ui["post_trigger_samples"])
+    _set_widget_value("trigger_source_dropdown", ui["trigger_source"])
+    _set_widget_value("trigger_edge_dropdown", ui["trigger_edge"])
+    _set_widget_value("trigger_threshold_input", ui["trigger_threshold"])
+    _set_widget_value(
+        "external_trigger_coupling_dropdown", ui["ext_trigger_coupling"]
+    )
+    _set_widget_value(
+        "external_trigger_input_range_dropdown",
+        trigger_input_range_to_label(ui["ext_trigger_input_range"]),
+    )
+    _set_widget_value(
+        "external_trigger_impedance_dropdown", ui["ext_trigger_impedance"]
+    )
+    _set_widget_value("spectrum_axis_combo", ui["spectrum_axis"])
+    _set_widget_value("d_frep_input", ui["d_frep_hz"])
+    _set_widget_value("frio_input", ui["frio_mhz"])
+    _set_widget_value("m1_input", ui["m1"])
+    _set_widget_value("m2_input", ui["m2"])
+    _set_widget_value("m3_input", ui["m3"])
+    _set_widget_value("save_enabled_checkbox", ui["save_enabled"])
+    _set_widget_value("save_file_input", ui["save_file"])
+    _set_widget_value("save_format_combo", ui["save_format"])
+    _set_widget_value("save_when_combo", ui["save_when"])
+
+
+def reset_settings_to_defaults():
+    """Restore acquisition, trigger, spectrum, and save settings to defaults.
+
+    No-op while gathering so a live capture cannot change board settings
+    under itself. Font scale is left alone (it has its own chooser).
+    """
+    if ifm.gathering:
+        print("Cannot reset settings while collecting data")
+        return False
+    ui = default_ui_settings()
+    apply_ui_settings_to_state(ui)
+    apply_ui_settings_to_widgets(ui)
+    update_mode_dependent_widgets()
+    update_external_trigger_controls()
+    update_channel_series_visibility()
+    apply_live_axis_limits()
+    _update_spectrum_axis_label()
+    refresh_spectrum_from_cache()
+    save_config(ui, quiet=True)
+    print("Reset all settings to defaults")
+    return True
 
 
 def _current_threshold() -> float:
@@ -2062,35 +2171,7 @@ def main():
     print(f"Using font scale: {font_scale:.2f}")
 
     ui = load_ui_settings()
-    ifm.save_file = ui["save_file"]
-    ifm.save_enabled = ui["save_enabled"]
-    ifm.save_format = ui["save_format"]
-    ifm.save_when = ui["save_when"]
-    ifm.mode = Mode[ui["mode"]]
-    ifm.samplerate = ui["samplerate"]
-    ifm.input_range = ui["input_range"]
-    ifm.pre_trigger_samples = ui["pre_trigger_samples"]
-    ifm.post_trigger_samples = ui["post_trigger_samples"]
-    ifm.max_capture_rate_hz = ui["max_capture_rate_hz"]
-    ifm.d_frep_hz = ui["d_frep_hz"]
-    ifm.frio_mhz = ui["frio_mhz"]
-    ifm.m1 = ui["m1"]
-    ifm.m2 = ui["m2"]
-    ifm.m3 = ui["m3"]
-    ifm.spectrum_axis = normalize_spectrum_axis(ui["spectrum_axis"])
-    ifm.apodization = normalize_apodization(ui["apodization"])
-    ifm.trigger_source = ui["trigger_source"]
-    ifm.trigger_edge = ui["trigger_edge"]
-    ifm.trigger_threshold = ui["trigger_threshold"]
-    ifm.ext_trigger_coupling = ui["ext_trigger_coupling"]
-    ifm.ext_trigger_input_range = ui["ext_trigger_input_range"]
-    ifm.ext_trigger_impedance = ui["ext_trigger_impedance"]
-    ifm.channel1 = ui["channel1"]
-    ifm.channel2 = ui["channel2"]
-    ifm.channel3 = ui["channel3"]
-    ifm.channel4 = ui["channel4"]
-    ifm.threshold = ui["threshold"]
-    ifm.interferograms_target = ui["interferograms"]
+    apply_ui_settings_to_state(ui)
     print(
         f"Loaded UI settings: mode={ui['mode']}, samplerate={ui['samplerate']}, "
         f"input_range={input_range_to_label(ui['input_range'])}, "
@@ -2741,6 +2822,18 @@ def main():
                                 tag="scale_button",
                                 callback=lambda: change_font_scale(),
                             )
+                            dpg.add_button(
+                                label="Reset to Default",
+                                tag="reset_defaults_button",
+                                callback=lambda: reset_settings_to_defaults(),
+                            )
+                            with dpg.tooltip("reset_defaults_button"):
+                                dpg.add_text(
+                                    "Restore all acquisition, trigger, spectrum, "
+                                    "and save settings to factory defaults.\n"
+                                    "Disabled while collecting data. "
+                                    "UI scale is unchanged."
+                                )
                             dpg.add_button(
                                 label="Exit",
                                 tag="exit_button",

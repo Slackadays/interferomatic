@@ -156,6 +156,43 @@ def _parse_float(value, default, minimum=None, maximum=None):
     return parsed
 
 
+def default_ui_settings():
+    """Return factory-default UI field values (same keys as load_ui_settings)."""
+    return {
+        "interferograms": DEFAULT_INTERFEROGRAMS,
+        "threshold": float(DEFAULT_THRESHOLD),
+        "save_file": DEFAULT_SAVE_FILE,
+        "save_enabled": DEFAULT_SAVE_ENABLED,
+        "save_format": DEFAULT_SAVE_FORMAT,
+        "save_when": DEFAULT_SAVE_WHEN,
+        "mode": DEFAULT_MODE,
+        "samplerate": DEFAULT_SAMPLERATE,
+        "input_range": DEFAULT_INPUT_RANGE,
+        "bulk_limit": DEFAULT_BULK_LIMIT,
+        "bulk_unit": DEFAULT_BULK_UNIT,
+        "channel1": DEFAULT_CHANNEL1,
+        "channel2": DEFAULT_CHANNEL2,
+        "channel3": DEFAULT_CHANNEL3,
+        "channel4": DEFAULT_CHANNEL4,
+        "pre_trigger_samples": DEFAULT_PRE_TRIGGER_SAMPLES,
+        "post_trigger_samples": DEFAULT_POST_TRIGGER_SAMPLES,
+        "max_capture_rate_hz": DEFAULT_MAX_CAPTURE_RATE_HZ,
+        "d_frep_hz": float(DEFAULT_DFREP_HZ),
+        "frio_mhz": float(DEFAULT_FRIO_MHZ),
+        "m1": float(DEFAULT_M1),
+        "m2": float(DEFAULT_M2),
+        "m3": float(DEFAULT_M3),
+        "spectrum_axis": DEFAULT_SPECTRUM_AXIS,
+        "apodization": DEFAULT_APODIZATION,
+        "trigger_source": DEFAULT_TRIGGER_SOURCE,
+        "trigger_edge": DEFAULT_TRIGGER_EDGE,
+        "trigger_threshold": DEFAULT_TRIGGER_THRESHOLD,
+        "ext_trigger_coupling": DEFAULT_EXT_TRIGGER_COUPLING,
+        "ext_trigger_input_range": DEFAULT_EXT_TRIGGER_INPUT_RANGE,
+        "ext_trigger_impedance": DEFAULT_EXT_TRIGGER_IMPEDANCE,
+    }
+
+
 def load_ui_settings():
     """
     Load persisted UI field values from config.json.
