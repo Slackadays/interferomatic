@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Interferomatic
+GenericName=Frequency Comb Spectrometer
+Comment=Collect interferograms and generate a transmission spectrum through frequency comb spectroscopy
+Exec=/usr/bin/python /home/gage/interferomatic/main.py
+TryExec=/usr/bin/python
+Path=/home/gage/interferomatic
+Icon=applications-science
+Terminal=false
+StartupNotify=true
+Categories=Science;Physics;Engineering;
+Keywords=interferometry;spectroscopy;frequency comb;Gage;spectrum;interferogram;
