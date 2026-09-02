@@ -23,8 +23,59 @@ def app(monkeypatch):
     dpg.destroy_context()
 
 
+def test_file_dialogs_list_files_not_only_directories(app):
+    """DPG hides files unless the dialog has at least one extension filter."""
+    main_mod, _saved = app
+    with dpg.window(tag="test_win"):
+        dpg.add_file_dialog(
+            tag="file_dialog",
+            show=False,
+            directory_selector=False,
+        )
+        dpg.add_file_dialog(
+            tag="baseline_file_dialog",
+            show=False,
+            directory_selector=False,
+        )
+    main_mod._add_spectrum_file_dialog_filters("file_dialog")
+    main_mod._add_spectrum_file_dialog_filters("baseline_file_dialog")
+    for tag in ("file_dialog", "baseline_file_dialog"):
+        children = dpg.get_item_children(tag)
+        assert children, f"{tag} should have filter children"
+        slots = [ids for ids in children.values() if ids]
+        assert any(slots), f"{tag} is missing file-extension filters"
+
+
+def test_path_from_file_dialog_recovers_csv_from_star_filter():
+    app_data = {
+        "current_filter": ".*",
+        "current_path": "/home/gage/Desktop",
+        "file_name": "blank.*",
+        "file_path_name": "/home/gage/Desktop/blank.*",
+        "selections": {
+            "blank.csv": "/home/gage/Desktop/blank.csv",
+        },
+    }
+    assert main._path_from_file_dialog(app_data) == "/home/gage/Desktop/blank.csv"
+
+
+def test_path_from_file_dialog_strips_star_when_typing_a_new_name():
+    app_data = {
+        "current_filter": ".*",
+        "current_path": "/home/gage/Desktop",
+        "file_name": "new_avg.*",
+        "file_path_name": "/home/gage/Desktop/new_avg.*",
+        "selections": {
+            "old.csv": "/home/gage/Desktop/old.csv",
+        },
+    }
+    assert main._path_from_file_dialog(app_data) == "/home/gage/Desktop/new_avg"
+
+
 def test_reset_is_listed_with_locked_settings():
     assert "reset_defaults_button" in main.SETTINGS_WIDGETS
+    assert "load_baseline_button" in main.SETTINGS_WIDGETS
+    assert "baseline_file_input" in main.SETTINGS_WIDGETS
     assert "scale_button" not in main.SETTINGS_WIDGETS
     assert "exit_button" not in main.SETTINGS_WIDGETS
 
@@ -51,6 +102,7 @@ def test_reset_applies_defaults_to_state_and_widgets(app):
     main_mod.ifm.trigger_source = "External"
     main_mod.ifm.save_enabled = True
     main_mod.ifm.save_file = "/tmp/out.csv"
+    main_mod.ifm.baseline_file = "/tmp/blank.csv"
 
     with dpg.window(tag="test_win"):
         dpg.add_combo(
@@ -90,6 +142,7 @@ def test_reset_applies_defaults_to_state_and_widgets(app):
     assert main_mod.ifm.trigger_source == defaults["trigger_source"]
     assert main_mod.ifm.save_enabled is False
     assert main_mod.ifm.save_file == ""
+    assert main_mod.ifm.baseline_file == ""
 
     assert dpg.get_value("mode_combo") == "Monitor signal"
     assert dpg.get_value("sample_rate_dropdown") == "200 MS/s"

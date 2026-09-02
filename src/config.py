@@ -9,6 +9,7 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 DEFAULT_INTERFEROGRAMS = 100000
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_SAVE_FILE = ""
+DEFAULT_BASELINE_FILE = ""
 DEFAULT_SAVE_ENABLED = False
 SAVE_FORMAT_BINARY = "Binary (float64)"
 SAVE_FORMAT_CSV_NM = "CSV (nm, amplitude)"
@@ -44,7 +45,7 @@ DEFAULT_MAX_CAPTURE_RATE_HZ = 60
 MIN_MAX_CAPTURE_RATE_HZ = 1
 MAX_MAX_CAPTURE_RATE_HZ = 1000
 BULK_UNITS = ("MB", "GB", "seconds", "minutes")
-VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE")
+VALID_MODES = ("MONITOR", "COLLECT", "AVERAGE", "BASELINE")
 # Allowed InputRange values (mV peak-to-peak), matching the UI dropdown.
 VALID_INPUT_RANGES = (200, 400, 1000, 2000, 4000, 10000)
 # Trigger UI defaults / allowed values (labels match main.py combo items).
@@ -162,6 +163,7 @@ def default_ui_settings():
         "interferograms": DEFAULT_INTERFEROGRAMS,
         "threshold": float(DEFAULT_THRESHOLD),
         "save_file": DEFAULT_SAVE_FILE,
+        "baseline_file": DEFAULT_BASELINE_FILE,
         "save_enabled": DEFAULT_SAVE_ENABLED,
         "save_format": DEFAULT_SAVE_FORMAT,
         "save_when": DEFAULT_SAVE_WHEN,
@@ -197,7 +199,7 @@ def load_ui_settings():
     """
     Load persisted UI field values from config.json.
     Returns a dict with keys: interferograms, threshold, save_file,
-    save_enabled, save_format, save_when, apodization, mode,
+    baseline_file, save_enabled, save_format, save_when, apodization, mode,
     samplerate, input_range, bulk_limit, bulk_unit, channel1–channel4,
     pre/post trigger samples, max_capture_rate_hz, and trigger options.
     """
@@ -219,6 +221,10 @@ def load_ui_settings():
     save_file = config.get("save_file", DEFAULT_SAVE_FILE)
     if not isinstance(save_file, str):
         save_file = DEFAULT_SAVE_FILE
+
+    baseline_file = config.get("baseline_file", DEFAULT_BASELINE_FILE)
+    if not isinstance(baseline_file, str):
+        baseline_file = DEFAULT_BASELINE_FILE
 
     save_enabled = config.get("save_enabled", DEFAULT_SAVE_ENABLED)
     if not isinstance(save_enabled, bool):
@@ -370,6 +376,7 @@ def load_ui_settings():
         "interferograms": interferograms,
         "threshold": threshold,
         "save_file": save_file,
+        "baseline_file": baseline_file,
         "save_enabled": save_enabled,
         "save_format": save_format,
         "save_when": save_when,

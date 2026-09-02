@@ -14,14 +14,18 @@ from src.spectrum import (
     apodization_window,
     compute_rf_spectrum,
     compute_spectrum,
+    convert_spectrum_x,
     dual_comb_period_samples,
+    infer_optical_axis,
     is_wavenumber_axis,
     map_rf_to_optical,
     normalize_apodization,
     normalize_spectrum_axis,
     optical_resolution_pm,
+    read_spectrum_file,
     rf_bin_hz,
     slice_spectrum_for_view,
+    subtract_baseline,
     write_spectrum_file,
 )
 
@@ -179,6 +183,18 @@ def test_write_spectrum_csv_wavenumber(tmp_path):
     assert header == "wavenumber,amplitude"
 
 
+def test_write_spectrum_replaces_star_suffix(tmp_path):
+    path = write_spectrum_file(
+        tmp_path / "spec.*",
+        [500.0],
+        [1.0],
+        binary=False,
+        x_column="nm",
+    )
+    assert path.name == "spec.csv"
+    assert path.is_file()
+
+
 def test_write_spectrum_binary_pairs(tmp_path):
     x = np.array([532.0, 533.0], dtype=np.float64)
     y = np.array([10.0, 20.0], dtype=np.float64)
@@ -187,6 +203,89 @@ def test_write_spectrum_binary_pairs(tmp_path):
     assert data.size == 4
     np.testing.assert_allclose(data[0::2], x)
     np.testing.assert_allclose(data[1::2], y)
+
+
+def test_read_spectrum_file_roundtrip_csv_and_binary(tmp_path):
+    x = np.array([1060.0, 1064.0, 1070.0], dtype=np.float64)
+    y = np.array([1.5, 2.25, 0.5], dtype=np.float64)
+    csv_path = write_spectrum_file(
+        tmp_path / "blank.csv", x, y, binary=False, x_column="nm"
+    )
+    xr, yr, axis = read_spectrum_file(csv_path)
+    np.testing.assert_allclose(xr, x)
+    np.testing.assert_allclose(yr, y)
+    assert axis == SPECTRUM_AXIS_WAVELENGTH
+
+    wn_x = np.array([9300.0, 9400.0, 9500.0], dtype=np.float64)
+    wn_path = write_spectrum_file(
+        tmp_path / "blank_wn.csv", wn_x, y, binary=False, x_column="wavenumber"
+    )
+    xr, yr, axis = read_spectrum_file(wn_path)
+    np.testing.assert_allclose(xr, wn_x)
+    np.testing.assert_allclose(yr, y)
+    assert axis == SPECTRUM_AXIS_WAVENUMBER
+
+    bin_path = write_spectrum_file(tmp_path / "blank.bin", x, y, binary=True)
+    xr, yr, axis = read_spectrum_file(bin_path)
+    np.testing.assert_allclose(xr, x)
+    np.testing.assert_allclose(yr, y)
+    assert axis == SPECTRUM_AXIS_WAVELENGTH
+
+
+def test_infer_optical_axis_from_magnitude():
+    assert infer_optical_axis([1060.0, 1070.0]) == SPECTRUM_AXIS_WAVELENGTH
+    assert infer_optical_axis([9300.0, 9400.0]) == SPECTRUM_AXIS_WAVENUMBER
+
+
+def test_convert_spectrum_x_nm_wavenumber():
+    nm = np.array([1000.0, 2000.0])
+    wn = convert_spectrum_x(nm, SPECTRUM_AXIS_WAVELENGTH, SPECTRUM_AXIS_WAVENUMBER)
+    np.testing.assert_allclose(wn, 1.0e7 / nm)
+    back = convert_spectrum_x(wn, SPECTRUM_AXIS_WAVENUMBER, SPECTRUM_AXIS_WAVELENGTH)
+    np.testing.assert_allclose(back, nm)
+    same = convert_spectrum_x(nm, SPECTRUM_AXIS_WAVELENGTH, SPECTRUM_AXIS_WAVELENGTH)
+    np.testing.assert_allclose(same, nm)
+
+
+def test_subtract_baseline_matching_grid():
+    x = np.array([1060.0, 1064.0, 1070.0])
+    sample = np.array([10.0, 12.0, 9.0])
+    blank = np.array([8.0, 8.5, 8.0])
+    out = subtract_baseline(
+        x,
+        sample,
+        x,
+        blank,
+        axis_mode=SPECTRUM_AXIS_WAVELENGTH,
+        baseline_axis=SPECTRUM_AXIS_WAVELENGTH,
+    )
+    np.testing.assert_allclose(out, sample - blank)
+
+
+def test_subtract_baseline_interpolates_and_converts_axis():
+    sample_x = np.array([1000.0, 1100.0, 1200.0])
+    sample_y = np.array([5.0, 6.0, 7.0])
+    # Same optical points in cm^-1, with an extra midpoint for interpolation.
+    blank_nm = np.array([1000.0, 1200.0])
+    blank_y = np.array([1.0, 3.0])
+    blank_wn = 1.0e7 / blank_nm
+    out = subtract_baseline(
+        sample_x,
+        sample_y,
+        blank_wn,
+        blank_y,
+        axis_mode=SPECTRUM_AXIS_WAVELENGTH,
+        baseline_axis=SPECTRUM_AXIS_WAVENUMBER,
+    )
+    expected_blank = np.array([1.0, 2.0, 3.0])
+    np.testing.assert_allclose(out, sample_y - expected_blank)
+
+
+def test_subtract_baseline_empty_leaves_sample():
+    x = np.array([1.0, 2.0])
+    y = np.array([4.0, 5.0])
+    out = subtract_baseline(x, y, [], [], axis_mode=SPECTRUM_AXIS_WAVELENGTH)
+    np.testing.assert_allclose(out, y)
 
 
 def test_rf_grid_lands_on_delta_frep():

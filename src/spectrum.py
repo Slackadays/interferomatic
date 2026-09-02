@@ -493,7 +493,7 @@ def write_spectrum_file(
     x_arr = x_arr[:n]
     y_arr = y_arr[:n]
 
-    if out.suffix == "":
+    if out.suffix in ("", ".*"):
         out = out.with_suffix(".bin" if binary else ".csv")
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -523,3 +523,158 @@ def write_spectrum_file(
                 tmp.unlink()
         raise
     return out
+
+
+# Split between typical NIR wavelength (nm) and wavenumber (cm^-1) values.
+# This instrument sits near 1064 nm / 9400 cm^-1; CSV headers take precedence.
+_AXIS_INFER_WAVENUMBER_MIN = 3500.0
+NM_TIMES_WAVENUMBER_CM = 1.0e7  # ν̃ [cm^-1] = 1e7 / λ [nm]
+
+
+def infer_optical_axis(x: Sequence[float]) -> str:
+    """Guess nm vs cm^-1 from the magnitude of *x* (binary files have no header)."""
+    arr = np.asarray(x, dtype=np.float64).ravel()
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return DEFAULT_SPECTRUM_AXIS
+    median = float(np.median(np.abs(finite)))
+    if median >= _AXIS_INFER_WAVENUMBER_MIN:
+        return SPECTRUM_AXIS_WAVENUMBER
+    return SPECTRUM_AXIS_WAVELENGTH
+
+
+def convert_spectrum_x(
+    x: Sequence[float],
+    from_axis: Optional[str],
+    to_axis: Optional[str],
+) -> np.ndarray:
+    """Convert optical X between wavelength (nm) and wavenumber (cm^-1)."""
+    arr = np.ascontiguousarray(np.asarray(x, dtype=np.float64).ravel())
+    if is_wavenumber_axis(from_axis) == is_wavenumber_axis(to_axis):
+        return arr
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = NM_TIMES_WAVENUMBER_CM / arr
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
+def _axis_from_csv_header(header: str) -> Optional[str]:
+    folded = header.casefold()
+    if "wavenumber" in folded or "cm^-1" in folded or "cm-1" in folded:
+        return SPECTRUM_AXIS_WAVENUMBER
+    compact = (
+        header.replace("\u207b", "^-")
+        .replace("⁻", "^-")
+        .replace("¹", "1")
+        .replace(" ", "")
+        .casefold()
+    )
+    if "cm^-1" in compact or "1/cm" in compact:
+        return SPECTRUM_AXIS_WAVENUMBER
+    if "nm" in folded or "wavelength" in folded:
+        return SPECTRUM_AXIS_WAVELENGTH
+    if "amplitude" in folded:
+        return SPECTRUM_AXIS_WAVELENGTH
+    return None
+
+
+def _read_csv_spectrum(path: Path) -> Tuple[np.ndarray, np.ndarray, str]:
+    text = path.read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError(f"empty spectrum file: {path}")
+    axis = _axis_from_csv_header(lines[0])
+    skiprows = 1 if axis is not None else 0
+    data = np.loadtxt(path, delimiter=",", ndmin=2, skiprows=skiprows)
+    if data.size < 2 or data.shape[1] < 2:
+        raise ValueError(f"spectrum CSV needs x,amplitude columns: {path}")
+    x = np.ascontiguousarray(data[:, 0], dtype=np.float64)
+    y = np.ascontiguousarray(data[:, 1], dtype=np.float64)
+    if axis is None:
+        axis = infer_optical_axis(x)
+    return x, y, axis
+
+
+def _read_binary_spectrum(path: Path) -> Tuple[np.ndarray, np.ndarray, str]:
+    data = np.fromfile(path, dtype="<f8")
+    if data.size < 2 or data.size % 2 != 0:
+        raise ValueError(f"spectrum binary file is not float64 x,y pairs: {path}")
+    x = np.ascontiguousarray(data[0::2], dtype=np.float64)
+    y = np.ascontiguousarray(data[1::2], dtype=np.float64)
+    return x, y, infer_optical_axis(x)
+
+
+def read_spectrum_file(
+    path: Union[str, Path],
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Load a spectrum written by ``write_spectrum_file``.
+
+    Returns ``(x, amplitude, axis_mode)`` where *axis_mode* is a
+    ``SPECTRUM_AXIS_*`` combo item. CSV headers win; binary files infer the
+    unit from the X values.
+    """
+    out = Path(path)
+    if not str(out) or not out.is_file():
+        raise FileNotFoundError(f"spectrum file not found: {path}")
+    suffix = out.suffix.casefold()
+    if suffix == ".csv":
+        return _read_csv_spectrum(out)
+    if suffix == ".bin":
+        return _read_binary_spectrum(out)
+    try:
+        return _read_csv_spectrum(out)
+    except Exception:
+        return _read_binary_spectrum(out)
+
+
+def subtract_baseline(
+    x: Sequence[float],
+    y: Sequence[float],
+    baseline_x: Sequence[float],
+    baseline_y: Sequence[float],
+    *,
+    axis_mode: Optional[str] = None,
+    baseline_axis: Optional[str] = None,
+) -> np.ndarray:
+    """Return ``y - baseline`` interpolated onto *x*.
+
+    *axis_mode* is the optical unit of *x*; *baseline_axis* is the unit of
+    *baseline_x*. Grids need not match. Empty/invalid baselines leave *y*
+    unchanged.
+    """
+    x_arr = np.ascontiguousarray(np.asarray(x, dtype=np.float64).ravel())
+    y_arr = np.ascontiguousarray(np.asarray(y, dtype=np.float64).ravel())
+    n = min(x_arr.size, y_arr.size)
+    if n == 0:
+        return y_arr[:n]
+    x_arr = x_arr[:n]
+    y_arr = y_arr[:n]
+
+    bx = convert_spectrum_x(baseline_x, baseline_axis, axis_mode)
+    by = np.ascontiguousarray(np.asarray(baseline_y, dtype=np.float64).ravel())
+    m = min(bx.size, by.size)
+    if m < 2:
+        return y_arr.copy()
+    bx = bx[:m]
+    by = by[:m]
+    ok = np.isfinite(bx) & np.isfinite(by)
+    bx = bx[ok]
+    by = by[ok]
+    if bx.size < 2:
+        return y_arr.copy()
+
+    order = np.argsort(bx, kind="mergesort")
+    bx = bx[order]
+    by = by[order]
+    if np.any(np.diff(bx) == 0.0):
+        uniq, inverse, counts = np.unique(bx, return_inverse=True, return_counts=True)
+        sums = np.zeros(uniq.size, dtype=np.float64)
+        np.add.at(sums, inverse, by)
+        bx = uniq
+        by = sums / np.maximum(counts.astype(np.float64), 1.0)
+        if bx.size < 2:
+            return y_arr.copy()
+
+    if bx.size == n and np.allclose(bx, x_arr, rtol=0.0, atol=1e-12):
+        return y_arr - by
+    return y_arr - np.interp(x_arr, bx, by)

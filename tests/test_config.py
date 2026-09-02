@@ -12,6 +12,7 @@ def test_default_ui_settings_factory_values():
     assert ui["interferograms"] == config.DEFAULT_INTERFEROGRAMS
     assert ui["threshold"] == config.DEFAULT_THRESHOLD
     assert ui["save_file"] == config.DEFAULT_SAVE_FILE
+    assert ui["baseline_file"] == config.DEFAULT_BASELINE_FILE
     assert ui["save_enabled"] is config.DEFAULT_SAVE_ENABLED
     assert ui["save_format"] == config.DEFAULT_SAVE_FORMAT
     assert ui["save_when"] == config.DEFAULT_SAVE_WHEN
@@ -76,3 +77,21 @@ def test_save_config_writes_defaults_without_dropping_font_scale(tmp_path, monke
     assert on_disk["font_scale"] == 0.75
     assert on_disk["samplerate"] == config.DEFAULT_SAMPLERATE
     assert on_disk["mode"] == config.DEFAULT_MODE
+
+
+def test_load_ui_settings_accepts_baseline_mode_and_file(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "mode": "BASELINE",
+                "baseline_file": "/tmp/blank.csv",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_PATH", path)
+    loaded = config.load_ui_settings()
+    assert loaded["mode"] == "BASELINE"
+    assert loaded["baseline_file"] == "/tmp/blank.csv"
+    assert "BASELINE" in config.VALID_MODES

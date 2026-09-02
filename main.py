@@ -28,6 +28,7 @@ from src.config import (
     DEFAULT_M2,
     DEFAULT_M3,
     DEFAULT_APODIZATION,
+    DEFAULT_BASELINE_FILE,
     DEFAULT_SAVE_ENABLED,
     DEFAULT_SAVE_FORMAT,
     DEFAULT_SAVE_WHEN,
@@ -69,6 +70,8 @@ from src.spectrum import (
     slice_spectrum_for_view,
     spectrum_view_limits,
     write_spectrum_file,
+    read_spectrum_file,
+    subtract_baseline,
     APODIZATION_ITEMS,
     SPECTRUM_AXIS_ITEMS,
     SPECTRUM_AXIS_WAVELENGTH,
@@ -122,12 +125,14 @@ class Mode(Enum):
     MONITOR = 1
     COLLECT = 2
     AVERAGE = 3
+    BASELINE = 4
 
 
 MODE_LABELS = {
     Mode.MONITOR: "Monitor signal",
     Mode.COLLECT: "Collect bulk data",
     Mode.AVERAGE: "Average interferograms",
+    Mode.BASELINE: "Baseline for Average Interferograms",
 }
 LABEL_TO_MODE = {label: mode for mode, label in MODE_LABELS.items()}
 
@@ -242,6 +247,10 @@ class ifmstate:
     gathering = False
     has_gage = False
     save_file = ""
+    baseline_file = DEFAULT_BASELINE_FILE
+    baseline_x = None
+    baseline_y = None
+    baseline_axis = None
     save_enabled = DEFAULT_SAVE_ENABLED
     save_format = DEFAULT_SAVE_FORMAT
     save_when = DEFAULT_SAVE_WHEN
@@ -341,6 +350,8 @@ SETTINGS_WIDGETS = (
     "save_enabled_checkbox",
     "save_file_input",
     "browse_button",
+    "baseline_file_input",
+    "load_baseline_button",
     "save_format_combo",
     "save_when_combo",
     "channel1_checkbox",
@@ -367,6 +378,12 @@ SETTINGS_WIDGETS = (
 )
 
 
+def is_averaging_mode(mode=None) -> bool:
+    """True for Average interferograms and Baseline for Average Interferograms."""
+    m = ifm.mode if mode is None else mode
+    return m in (Mode.AVERAGE, Mode.BASELINE)
+
+
 def enabled_channels():
     """Return channel numbers currently checked in the UI / state."""
     channels = []
@@ -385,14 +402,23 @@ def update_mode_dependent_widgets():
     """Show only the limit controls and spectrum chart that apply to the mode."""
     if not dpg.does_item_exist("average_controls"):
         return
-    show_average = ifm.mode == Mode.AVERAGE
+    show_average = is_averaging_mode()
+    show_apply_baseline = ifm.mode == Mode.AVERAGE
     show_bulk = ifm.mode == Mode.COLLECT
     dpg.configure_item("average_controls", show=show_average)
+    if dpg.does_item_exist("baseline_controls"):
+        dpg.configure_item("baseline_controls", show=show_apply_baseline)
+    if dpg.does_item_exist("baseline_collect_hint"):
+        dpg.configure_item(
+            "baseline_collect_hint", show=ifm.mode == Mode.BASELINE
+        )
     dpg.configure_item("bulk_controls", show=show_bulk)
     if dpg.does_item_exist("average_status_text"):
         if not show_average:
             dpg.set_value("average_status_text", "")
     _set_spectrum_chart_visible(show_average)
+    _update_baseline_status()
+    _update_spectrum_series_label()
 
 
 def _set_spectrum_chart_visible(show: bool) -> None:
@@ -443,15 +469,16 @@ def set_gathering_ui(gathering: bool):
         dpg.bind_item_theme("startstop_button", "start_button_theme")
         dpg.set_item_label("startstop_button", "Start")
         set_settings_enabled(True)
-        # Keep the last average on the plot when Average mode finishes;
+        # Keep the last average on the plot when averaging finishes;
         # clear the snapshot when leaving other modes.
-        if ifm.mode != Mode.AVERAGE:
+        if not is_averaging_mode():
             ifm.average_result = None
 
 
 def apply_ui_settings_to_state(ui):
     """Copy a load_ui_settings() dict onto ifm (in-memory app state)."""
     ifm.save_file = ui["save_file"]
+    ifm.baseline_file = ui.get("baseline_file", DEFAULT_BASELINE_FILE)
     ifm.save_enabled = ui["save_enabled"]
     ifm.save_format = ui["save_format"]
     ifm.save_when = ui["save_when"]
@@ -480,6 +507,7 @@ def apply_ui_settings_to_state(ui):
     ifm.channel4 = ui["channel4"]
     ifm.threshold = ui["threshold"]
     ifm.interferograms_target = ui["interferograms"]
+    _load_baseline_from_path(ifm.baseline_file, announce=False)
 
 
 def _set_widget_value(tag, value):
@@ -529,8 +557,10 @@ def apply_ui_settings_to_widgets(ui):
     _set_widget_value("m3_input", ui["m3"])
     _set_widget_value("save_enabled_checkbox", ui["save_enabled"])
     _set_widget_value("save_file_input", ui["save_file"])
+    _set_widget_value("baseline_file_input", ui.get("baseline_file", DEFAULT_BASELINE_FILE))
     _set_widget_value("save_format_combo", ui["save_format"])
     _set_widget_value("save_when_combo", ui["save_when"])
+    _update_baseline_status()
 
 
 def reset_settings_to_defaults():
@@ -591,7 +621,12 @@ def _settings_panel_text_wrap() -> int:
 def refresh_settings_text_wraps():
     """Keep long sidebar labels wrapping inside the settings column."""
     wrap = _settings_panel_text_wrap()
-    for tag in ("average_status_text", "gage_less_warning"):
+    for tag in (
+        "average_status_text",
+        "baseline_status_text",
+        "baseline_collect_hint",
+        "gage_less_warning",
+    ):
         if dpg.does_item_exist(tag):
             dpg.configure_item(tag, wrap=wrap)
 
@@ -712,7 +747,7 @@ def _start_capture_engine(
         ifm.live_engine.start(
             channels,
             average=average,
-            spectrum=_build_spectrum_dict() if ifm.mode == Mode.AVERAGE else None,
+            spectrum=_build_spectrum_dict() if is_averaging_mode() else None,
         )
         _warn_if_record_too_short(pre, post)
         apply_live_axis_limits()
@@ -979,8 +1014,12 @@ def _refresh_live_view_lod() -> None:
 def _spectrum_plot_title() -> str:
     """Plot title that follows the Spectrum X-axis dropdown."""
     if is_wavenumber_axis(ifm.spectrum_axis):
-        return f"Spectrum (FFT)  wavenumber ({WAVENUMBER_UNIT})"
-    return "Spectrum (FFT)  wavelength (nm)"
+        title = f"Spectrum (FFT)  wavenumber ({WAVENUMBER_UNIT})"
+    else:
+        title = "Spectrum (FFT)  wavelength (nm)"
+    if _baseline_is_applied():
+        title += "  - baseline"
+    return title
 
 
 def _spectrum_axis_label() -> str:
@@ -1024,6 +1063,117 @@ def _remap_cached_rf_spectrum() -> bool:
     return True
 
 
+def _clear_baseline_arrays() -> None:
+    ifm.baseline_x = None
+    ifm.baseline_y = None
+    ifm.baseline_axis = None
+
+
+def _baseline_is_loaded() -> bool:
+    return (
+        ifm.baseline_x is not None
+        and ifm.baseline_y is not None
+        and np.size(ifm.baseline_x) >= 2
+        and np.size(ifm.baseline_y) >= 2
+    )
+
+
+def _baseline_is_applied() -> bool:
+    """Subtraction is Average-mode only; Baseline mode only records a blank."""
+    return ifm.mode == Mode.AVERAGE and _baseline_is_loaded()
+
+
+def _apply_baseline_xy(x, y, axis_mode):
+    """Subtract the loaded baseline from *(x, y)* in Average interferograms mode."""
+    if not _baseline_is_applied():
+        return x, y
+    y_sub = subtract_baseline(
+        x,
+        y,
+        ifm.baseline_x,
+        ifm.baseline_y,
+        axis_mode=axis_mode,
+        baseline_axis=ifm.baseline_axis,
+    )
+    return x, y_sub
+
+
+def _update_spectrum_series_label() -> None:
+    if not dpg.does_item_exist("spectrum_series"):
+        return
+    label = "Spectrum - baseline" if _baseline_is_applied() else "Spectrum"
+    dpg.configure_item("spectrum_series", label=label)
+
+
+def _update_baseline_status() -> None:
+    if not dpg.does_item_exist("baseline_status_text"):
+        return
+    if _baseline_is_loaded():
+        n = int(min(np.size(ifm.baseline_x), np.size(ifm.baseline_y)))
+        name = Path(ifm.baseline_file).name if ifm.baseline_file else ""
+        text = f"Loaded {n} points" + (f" ({name})" if name else "")
+    elif (ifm.baseline_file or "").strip():
+        text = "Baseline file not loaded"
+    else:
+        text = "No baseline loaded (raw average)"
+    dpg.set_value("baseline_status_text", text)
+    refresh_settings_text_wraps()
+
+
+def _refresh_spectrum_after_baseline_change() -> None:
+    _update_baseline_status()
+    _update_spectrum_axis_label()
+    _update_spectrum_series_label()
+    if ifm.last_spectrum_x is not None:
+        ifm.spectrum_lod_dirty = True
+        _push_spectrum_view()
+
+
+def _load_baseline_from_path(path: str, *, announce: bool) -> bool:
+    """Load a saved blank spectrum for Average-mode subtraction."""
+    dest = (path or "").strip()
+    ifm.baseline_file = dest
+    if not dest:
+        _clear_baseline_arrays()
+        _refresh_spectrum_after_baseline_change()
+        return True
+    try:
+        x, y, axis = read_spectrum_file(dest)
+    except Exception as e:
+        _clear_baseline_arrays()
+        msg = f"Failed to load baseline: {e}"
+        print(msg)
+        if announce:
+            try:
+                show_error_window(msg)
+            except Exception:
+                pass
+        _refresh_spectrum_after_baseline_change()
+        return False
+    ifm.baseline_x = x
+    ifm.baseline_y = y
+    ifm.baseline_axis = axis
+    print(f"Loaded baseline ({axis}, {x.size} points) from {dest}")
+    _refresh_spectrum_after_baseline_change()
+    return True
+
+
+def _ensure_baseline_loaded_for_start() -> bool:
+    """Load the Average-mode baseline path before capture. Empty path is allowed."""
+    dest = (ifm.baseline_file or "").strip()
+    if dpg.does_item_exist("baseline_file_input"):
+        typed = dpg.get_value("baseline_file_input") or ""
+        if isinstance(typed, str):
+            dest = typed.strip()
+            ifm.baseline_file = dest
+    if not dest:
+        _clear_baseline_arrays()
+        _update_baseline_status()
+        print("Average mode: no baseline loaded; showing raw average")
+        return True
+    return _load_baseline_from_path(dest, announce=True)
+
+
 def _save_axis_mode() -> str:
     """Optical X unit for the current save-format choice."""
     if ifm.save_format == SAVE_FORMAT_CSV_WN:
@@ -1059,14 +1209,16 @@ def _spectrum_xy_for_save():
                 axis_mode=axis_mode,
             )
             if x_axis.size >= 1:
-                return x_axis, y_out
+                return _apply_baseline_xy(x_axis, y_out, axis_mode)
     if (
         ifm.last_spectrum_x is not None
         and ifm.last_spectrum_mag is not None
         and normalize_spectrum_axis(ifm.spectrum_axis)
         == normalize_spectrum_axis(axis_mode)
     ):
-        return ifm.last_spectrum_x, ifm.last_spectrum_mag
+        return _apply_baseline_xy(
+            ifm.last_spectrum_x, ifm.last_spectrum_mag, axis_mode
+        )
     if ifm.last_spectrum_y is not None:
         from src.spectrum import compute_spectrum
 
@@ -1081,7 +1233,7 @@ def _spectrum_xy_for_save():
             zpd_index=int(ifm.pre_trigger_samples),
         )
         if x_axis.size >= 1:
-            return x_axis, y_out
+            return _apply_baseline_xy(x_axis, y_out, axis_mode)
     return None
 
 
@@ -1204,6 +1356,7 @@ def _update_spectrum_axis_label() -> None:
     if dpg.does_item_exist("spectrum_plot"):
         dpg.set_item_label("spectrum_plot", plot_title)
         dpg.configure_item("spectrum_plot", label=plot_title)
+    _update_spectrum_series_label()
 
 
 def _current_spectrum_x_limits():
@@ -1227,6 +1380,7 @@ def _push_spectrum_view(x_lo=None, x_hi=None) -> None:
     if x is None or mag is None or len(x) < 2:
         dpg.set_value("spectrum_series", [PLACEHOLDER_X, PLACEHOLDER_Y])
         return
+    x, mag = _apply_baseline_xy(x, mag, ifm.spectrum_axis)
     if x_lo is None or x_hi is None:
         limits = _current_spectrum_x_limits()
         if limits is None:
@@ -1325,7 +1479,7 @@ def apply_spectrum_axis_limits():
 
 def process_spectrum_axis_limits():
     """Per-frame spectrum view force/unlock and resolution-preserving LOD."""
-    if ifm.mode != Mode.AVERAGE:
+    if not is_averaging_mode():
         return
     if ifm.spectrum_force_frames > 0 and ifm.spectrum_x_limits is not None:
         x_lo, x_hi = ifm.spectrum_x_limits
@@ -1469,7 +1623,7 @@ def average_tick():
     UI thread never touches full-resolution traces at 40+ Hz.
     """
     engine = ifm.live_engine
-    if engine is None or not ifm.gathering or ifm.mode != Mode.AVERAGE:
+    if engine is None or not ifm.gathering or not is_averaging_mode():
         return
 
     now = time.monotonic()
@@ -1567,6 +1721,9 @@ def save_ui_settings_from_widgets():
     if dpg.does_item_exist("save_file_input"):
         data["save_file"] = dpg.get_value("save_file_input") or ""
         ifm.save_file = data["save_file"]
+    if dpg.does_item_exist("baseline_file_input"):
+        data["baseline_file"] = dpg.get_value("baseline_file_input") or ""
+        ifm.baseline_file = data["baseline_file"]
     if dpg.does_item_exist("save_format_combo"):
         fmt = dpg.get_value("save_format_combo")
         if fmt in SAVE_FORMAT_ITEMS:
@@ -1730,6 +1887,14 @@ def mode_callback(sender, app_data):
     update_mode_dependent_widgets()
     save_config({"mode": ifm.mode.name}, quiet=True)
     print(f"Mode set to: {ifm.mode.name}")
+    if ifm.mode == Mode.AVERAGE:
+        dest = (ifm.baseline_file or "").strip()
+        if dest and not _baseline_is_loaded():
+            _load_baseline_from_path(dest, announce=False)
+        else:
+            _refresh_spectrum_after_baseline_change()
+    elif is_averaging_mode():
+        _refresh_spectrum_after_baseline_change()
 
 def samplerate_callback(sender, app_data):
     try:
@@ -1963,7 +2128,7 @@ def button1_callback(sender, app_data):
 
     if ifm.gathering:
         print("Stopping data gathering...")
-        if ifm.mode == Mode.AVERAGE:
+        if is_averaging_mode():
             finish_averaging(completed=False)
         else:
             _stop_capture_engine()
@@ -1993,22 +2158,37 @@ def button1_callback(sender, app_data):
         show_error_window("Collect bulk data mode is not implemented yet.")
         return
 
-    if ifm.mode == Mode.AVERAGE:
+    if is_averaging_mode():
+        if ifm.mode == Mode.AVERAGE and not _ensure_baseline_loaded_for_start():
+            return
         pre, post, _ = _clamp_live_sample_inputs()
         ifm.threshold = _current_threshold()
         ifm.interferograms_target = _current_interferograms_target()
         ifm.average_result = None
         ifm.last_autosave_t = time.monotonic()
+        label = (
+            "Baseline for Average Interferograms"
+            if ifm.mode == Mode.BASELINE
+            else "Average interferograms"
+        )
+        extra = ""
+        if ifm.mode == Mode.BASELINE:
+            extra = ", collecting baseline"
+        elif _baseline_is_loaded():
+            extra = f", baseline={ifm.baseline_file!r}"
+        else:
+            extra = ", no baseline loaded"
         print(
-            f"Average mode: target={ifm.interferograms_target}, "
+            f"{label}: target={ifm.interferograms_target}, "
             f"correlation threshold r≥{ifm.threshold:.3f}, "
             f"reference channel={channels[0]}"
+            + extra
         )
         if not _start_capture_engine(
             channels,
             pre,
             post,
-            "Average interferograms",
+            label,
             average={
                 "target": ifm.interferograms_target,
                 "threshold": ifm.threshold,
@@ -2073,16 +2253,87 @@ def save_when_callback(sender, app_data):
     ifm.save_when = app_data
     save_config({"save_when": app_data}, quiet=True)
 
-def save_file_callback(sender, app_data):
+def _add_spectrum_file_dialog_filters(parent: str) -> None:
+    """Show files in the DPG picker (no extensions → directories only)."""
+    dpg.add_file_extension(
+        ".*",
+        parent=parent,
+        custom_text="All files (*.*)",
+    )
+    dpg.add_file_extension(
+        ".csv",
+        parent=parent,
+        custom_text="CSV (*.csv)",
+    )
+    dpg.add_file_extension(
+        ".bin",
+        parent=parent,
+        custom_text="Binary (*.bin)",
+    )
+
+
+def _strip_dialog_star_suffix(path: str) -> str:
+    """Remove the fake ``.*`` extension DPG stuffs in from the All-files filter."""
+    if not isinstance(path, str):
+        return ""
+    path = path.strip()
+    if path.endswith(".*"):
+        return path[:-2]
+    return path
+
+
+def _path_from_file_dialog(app_data) -> str:
+    """Real path from a DPG file-dialog callback.
+
+    With filter ``.*``, ``file_path_name`` becomes ``name.*`` even when the
+    clicked file was ``name.csv``. The true path is in ``selections``.
+    """
     if isinstance(app_data, dict):
-        selected_file = app_data.get("file_path_name", "")
-    else:
-        selected_file = app_data
+        raw = app_data.get("file_path_name", "")
+        if not isinstance(raw, str):
+            raw = ""
+        stripped = _strip_dialog_star_suffix(raw)
+        stem = Path(stripped).stem if stripped else ""
+        selections = app_data.get("selections") or {}
+        if isinstance(selections, dict) and stem:
+            for name, path in selections.items():
+                if not isinstance(path, str) or not path.strip():
+                    continue
+                path = path.strip()
+                if Path(path).stem == stem or Path(str(name)).stem == stem:
+                    return path
+        return stripped
+    if isinstance(app_data, str):
+        return _strip_dialog_star_suffix(app_data)
+    return ""
+
+
+def save_file_callback(sender, app_data):
+    selected_file = _path_from_file_dialog(app_data)
 
     ifm.save_file = selected_file
     dpg.set_value("save_file_input", selected_file)
     save_config({"save_file": selected_file}, quiet=True)
     print(f"Save file set to: {ifm.save_file}")
+
+
+def baseline_file_text_callback(sender, app_data):
+    path = app_data if isinstance(app_data, str) else ""
+    ifm.baseline_file = path
+    save_config({"baseline_file": ifm.baseline_file}, quiet=True)
+    if not path.strip():
+        _clear_baseline_arrays()
+        _refresh_spectrum_after_baseline_change()
+    else:
+        _update_baseline_status()
+
+
+def load_baseline_file_callback(sender, app_data):
+    selected_file = _path_from_file_dialog(app_data)
+    if dpg.does_item_exist("baseline_file_input"):
+        dpg.set_value("baseline_file_input", selected_file)
+    if _load_baseline_from_path(selected_file, announce=True):
+        save_config({"baseline_file": selected_file}, quiet=True)
 
 def trigger_source_callback(sender, app_data):
     if app_data not in TRIGGER_SOURCE_ITEMS:
@@ -2217,7 +2468,8 @@ def main():
         f"{ui['ext_trigger_impedance']}], "
         f"channels=[{ui['channel1']}, {ui['channel2']}, {ui['channel3']}, {ui['channel4']}], "
         f"interferograms={ui['interferograms']}, bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
-        f"threshold={ui['threshold']}, save_file={ui['save_file']!r}"
+        f"threshold={ui['threshold']}, save_file={ui['save_file']!r}, "
+        f"baseline_file={ui.get('baseline_file', '')!r}"
     )
 
     # Live View engine (real Gage card when available, otherwise simulated).
@@ -2246,6 +2498,18 @@ def main():
             width=2000,
             height=1000,
         )
+        _add_spectrum_file_dialog_filters("file_dialog")
+        dpg.add_file_dialog(
+            label="Load baseline",
+            directory_selector=False,
+            show=False,
+            callback=load_baseline_file_callback,
+            tag="baseline_file_dialog",
+            modal=True,
+            width=2000,
+            height=1000,
+        )
+        _add_spectrum_file_dialog_filters("baseline_file_dialog")
 
         # Two-column layout: settings (left) | Live View (right).
         with dpg.table(
@@ -2346,7 +2610,7 @@ def main():
 
                         with dpg.group(
                             tag="average_controls",
-                            show=ifm.mode == Mode.AVERAGE,
+                            show=is_averaging_mode(),
                         ):
                             add_settings_label(
                                 "Interferograms to average", small_font
@@ -2413,6 +2677,63 @@ def main():
                                 wrap=280,
                             )
                             dpg.bind_item_font(status_id, small_font)
+                            collect_hint = dpg.add_text(
+                                "Collect a blank average and save it. "
+                                "Switch to Average interferograms to load "
+                                "and subtract that baseline.",
+                                tag="baseline_collect_hint",
+                                wrap=280,
+                                show=ifm.mode == Mode.BASELINE,
+                            )
+                            dpg.bind_item_font(collect_hint, small_font)
+                            dpg.add_spacer(height=20)
+
+                        with dpg.group(
+                            tag="baseline_controls",
+                            show=ifm.mode == Mode.AVERAGE,
+                        ):
+                            with dpg.collapsing_header(
+                                label="Baseline",
+                                tag="baseline_settings_header",
+                                default_open=True,
+                            ):
+                                add_settings_label("Baseline file", small_font)
+                                dpg.add_input_text(
+                                    tag="baseline_file_input",
+                                    default_value=ui.get(
+                                        "baseline_file", DEFAULT_BASELINE_FILE
+                                    ),
+                                    width=SETTINGS_WIDTH,
+                                    callback=baseline_file_text_callback,
+                                )
+                                dpg.add_button(
+                                    label="Load Baseline",
+                                    tag="load_baseline_button",
+                                    callback=lambda: dpg.show_item(
+                                        "baseline_file_dialog"
+                                    ),
+                                )
+                                with dpg.tooltip("load_baseline_button"):
+                                    dpg.add_text(
+                                        "Open a blank-sample spectrum saved "
+                                        "from Baseline for Average Interferograms "
+                                        "(CSV or binary). The live average is "
+                                        "shown minus this baseline.\n"
+                                        "Collect a new blank in Baseline mode; "
+                                        "this mode only applies it."
+                                    )
+                                with dpg.tooltip("baseline_file_input"):
+                                    dpg.add_text(
+                                        "Path of the blank (none) material "
+                                        "spectrum subtracted from the average. "
+                                        "Use Load Baseline to pick a file."
+                                    )
+                                baseline_status = dpg.add_text(
+                                    "",
+                                    tag="baseline_status_text",
+                                    wrap=280,
+                                )
+                                dpg.bind_item_font(baseline_status, small_font)
                             dpg.add_spacer(height=20)
 
                         with dpg.group(
@@ -2672,7 +2993,7 @@ def main():
                             label="Spectrum (FFT)",
                             tag="spectrum_settings_header",
                             default_open=True,
-                            show=ifm.mode == Mode.AVERAGE,
+                            show=is_averaging_mode(),
                         ):
                             add_settings_label("Spectrum X axis", small_font)
                             dpg.add_combo(
@@ -2904,7 +3225,7 @@ def main():
                                 label="Reset Spectrum",
                                 tag="reset_spectrum_button",
                                 callback=lambda: apply_spectrum_axis_limits(),
-                                show=ifm.mode == Mode.AVERAGE,
+                                show=is_averaging_mode(),
                             )
                             with dpg.tooltip("reset_spectrum_button"):
                                 dpg.add_text(
@@ -2913,13 +3234,13 @@ def main():
 
                         # Top: time-domain interferogram; bottom: optical FFT.
                         with dpg.subplots(
-                            2 if ifm.mode == Mode.AVERAGE else 1,
+                            2 if is_averaging_mode() else 1,
                             1,
                             label="",
                             tag="plot_subplots",
                             width=-1,
                             height=-1,
-                            row_ratios=(1.0, 1.0) if ifm.mode == Mode.AVERAGE else (1.0,),
+                            row_ratios=(1.0, 1.0) if is_averaging_mode() else (1.0,),
                             no_title=True,
                         ):
                             with dpg.plot(
@@ -2957,7 +3278,7 @@ def main():
                                 no_inputs=False,
                                 no_menus=False,
                                 no_box_select=False,
-                                show=ifm.mode == Mode.AVERAGE,
+                                show=is_averaging_mode(),
                             ):
                                 dpg.add_plot_legend()
                                 dpg.add_plot_axis(
@@ -3035,7 +3356,7 @@ def main():
         if ifm.gathering:
             if ifm.mode == Mode.MONITOR:
                 live_view_tick()
-            elif ifm.mode == Mode.AVERAGE:
+            elif is_averaging_mode():
                 average_tick()
         wrap_refresh_counter += 1
         if wrap_refresh_counter >= 30:
