@@ -41,6 +41,7 @@ def test_default_ui_settings_factory_values():
     assert ui["ext_trigger_coupling"] == config.DEFAULT_EXT_TRIGGER_COUPLING
     assert ui["ext_trigger_input_range"] == config.DEFAULT_EXT_TRIGGER_INPUT_RANGE
     assert ui["ext_trigger_impedance"] == config.DEFAULT_EXT_TRIGGER_IMPEDANCE
+    assert ui["reference_clock"] is config.DEFAULT_REFERENCE_CLOCK
 
 
 def test_load_ui_settings_matches_defaults_when_config_missing(tmp_path, monkeypatch):
@@ -95,3 +96,16 @@ def test_load_ui_settings_accepts_baseline_mode_and_file(tmp_path, monkeypatch):
     assert loaded["mode"] == "BASELINE"
     assert loaded["baseline_file"] == "/tmp/blank.csv"
     assert "BASELINE" in config.VALID_MODES
+
+
+def test_load_ui_settings_reference_clock(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"reference_clock": True}), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", path)
+    assert config.load_ui_settings()["reference_clock"] is True
+
+    path.write_text(json.dumps({"reference_clock": False}), encoding="utf-8")
+    assert config.load_ui_settings()["reference_clock"] is False
+
+    path.write_text(json.dumps({"reference_clock": 1}), encoding="utf-8")
+    assert config.load_ui_settings()["reference_clock"] is config.DEFAULT_REFERENCE_CLOCK

@@ -21,6 +21,7 @@ from src.config import (
     DEFAULT_EXT_TRIGGER_COUPLING,
     DEFAULT_EXT_TRIGGER_INPUT_RANGE,
     DEFAULT_EXT_TRIGGER_IMPEDANCE,
+    DEFAULT_REFERENCE_CLOCK,
     DEFAULT_MAX_CAPTURE_RATE_HZ,
     DEFAULT_DFREP_HZ,
     DEFAULT_FRIO_MHZ,
@@ -267,6 +268,7 @@ class ifmstate:
     ext_trigger_coupling = DEFAULT_EXT_TRIGGER_COUPLING
     ext_trigger_input_range = DEFAULT_EXT_TRIGGER_INPUT_RANGE  # mV pk-pk
     ext_trigger_impedance = DEFAULT_EXT_TRIGGER_IMPEDANCE
+    reference_clock = DEFAULT_REFERENCE_CLOCK
     channel1 = True
     channel2 = False
     channel3 = False
@@ -368,6 +370,7 @@ SETTINGS_WIDGETS = (
     "external_trigger_coupling_dropdown",
     "external_trigger_input_range_dropdown",
     "external_trigger_impedance_dropdown",
+    "reference_clock_checkbox",
     "d_frep_input",
     "frio_input",
     "m1_input",
@@ -501,6 +504,7 @@ def apply_ui_settings_to_state(ui):
     ifm.ext_trigger_coupling = ui["ext_trigger_coupling"]
     ifm.ext_trigger_input_range = ui["ext_trigger_input_range"]
     ifm.ext_trigger_impedance = ui["ext_trigger_impedance"]
+    ifm.reference_clock = ui["reference_clock"]
     ifm.channel1 = ui["channel1"]
     ifm.channel2 = ui["channel2"]
     ifm.channel3 = ui["channel3"]
@@ -549,6 +553,7 @@ def apply_ui_settings_to_widgets(ui):
     _set_widget_value(
         "external_trigger_impedance_dropdown", ui["ext_trigger_impedance"]
     )
+    _set_widget_value("reference_clock_checkbox", ui["reference_clock"])
     _set_widget_value("spectrum_axis_combo", ui["spectrum_axis"])
     _set_widget_value("d_frep_input", ui["d_frep_hz"])
     _set_widget_value("frio_input", ui["frio_mhz"])
@@ -728,6 +733,7 @@ def _start_capture_engine(
             if ifm.trigger_source == "External"
             else ""
         )
+        + (", refclk=10 MHz" if ifm.reference_clock else "")
         + ("" if ifm.has_gage else " (simulated)")
     )
     try:
@@ -743,6 +749,7 @@ def _start_capture_engine(
             trigger=trigger,
             max_capture_rate_hz=ifm.max_capture_rate_hz,
             trigger_timeout=trigger_timeout,
+            reference_clock=ifm.reference_clock,
         )
         ifm.live_engine.start(
             channels,
@@ -1867,6 +1874,9 @@ def save_ui_settings_from_widgets():
         if impedance in TRIGGER_IMPEDANCE_ITEMS:
             data["ext_trigger_impedance"] = impedance
             ifm.ext_trigger_impedance = impedance
+    if dpg.does_item_exist("reference_clock_checkbox"):
+        data["reference_clock"] = bool(dpg.get_value("reference_clock_checkbox"))
+        ifm.reference_clock = data["reference_clock"]
     save_config(data, quiet=True)
 
 def mode_callback(sender, app_data):
@@ -2399,6 +2409,15 @@ def external_trigger_impedance_callback(sender, app_data):
     print(f"External trigger impedance set to: {ifm.ext_trigger_impedance}")
 
 
+def reference_clock_callback(sender, app_data):
+    ifm.reference_clock = bool(app_data)
+    save_config({"reference_clock": ifm.reference_clock}, quiet=True)
+    print(
+        "Reference clock "
+        + ("enabled (10 MHz)" if ifm.reference_clock else "disabled")
+    )
+
+
 def add_settings_label(text: str, font) -> int | str:
     """Left-aligned small caption drawn above a full-width settings control."""
     label_id = dpg.add_text(text)
@@ -2466,6 +2485,7 @@ def main():
         f"ext_trig=[{ui['ext_trigger_coupling']}, "
         f"{trigger_input_range_to_label(ui['ext_trigger_input_range'])}, "
         f"{ui['ext_trigger_impedance']}], "
+        f"refclk={'on' if ui['reference_clock'] else 'off'}, "
         f"channels=[{ui['channel1']}, {ui['channel2']}, {ui['channel3']}, {ui['channel4']}], "
         f"interferograms={ui['interferograms']}, bulk_limit={ui['bulk_limit']} {ui['bulk_unit']}, "
         f"threshold={ui['threshold']}, save_file={ui['save_file']!r}, "
@@ -2984,6 +3004,26 @@ def main():
                                     default_value=ifm.ext_trigger_impedance,
                                     width=SETTINGS_WIDTH,
                                     callback=external_trigger_impedance_callback,
+                                )
+
+                        dpg.add_separator()
+                        dpg.add_spacer(height=20)
+
+                        with dpg.collapsing_header(
+                            label="Clock", default_open=True
+                        ):
+                            dpg.add_checkbox(
+                                label="Reference Clock (10 MHz)",
+                                tag="reference_clock_checkbox",
+                                default_value=ifm.reference_clock,
+                                callback=reference_clock_callback,
+                            )
+                            with dpg.tooltip("reference_clock_checkbox"):
+                                dpg.add_text(
+                                    "Lock the digitizer's internal oscillator "
+                                    "to a 10 MHz reference on the External "
+                                    "Clock input. Sample rate is still "
+                                    "selected under Acquisition."
                                 )
 
                         dpg.add_separator()

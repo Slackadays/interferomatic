@@ -76,6 +76,7 @@ def test_reset_is_listed_with_locked_settings():
     assert "reset_defaults_button" in main.SETTINGS_WIDGETS
     assert "load_baseline_button" in main.SETTINGS_WIDGETS
     assert "baseline_file_input" in main.SETTINGS_WIDGETS
+    assert "reference_clock_checkbox" in main.SETTINGS_WIDGETS
     assert "scale_button" not in main.SETTINGS_WIDGETS
     assert "exit_button" not in main.SETTINGS_WIDGETS
 
@@ -100,6 +101,7 @@ def test_reset_applies_defaults_to_state_and_widgets(app):
     main_mod.ifm.threshold = 0.1
     main_mod.ifm.input_range = 400
     main_mod.ifm.trigger_source = "External"
+    main_mod.ifm.reference_clock = True
     main_mod.ifm.save_enabled = True
     main_mod.ifm.save_file = "/tmp/out.csv"
     main_mod.ifm.baseline_file = "/tmp/blank.csv"
@@ -127,6 +129,7 @@ def test_reset_applies_defaults_to_state_and_widgets(app):
             items=list(main_mod.TRIGGER_SOURCE_ITEMS),
             default_value="External",
         )
+        dpg.add_checkbox(tag="reference_clock_checkbox", default_value=True)
         dpg.add_checkbox(tag="save_enabled_checkbox", default_value=True)
         dpg.add_input_text(tag="save_file_input", default_value="/tmp/out.csv")
         dpg.add_button(tag="reset_defaults_button", label="Reset to Default")
@@ -140,6 +143,7 @@ def test_reset_applies_defaults_to_state_and_widgets(app):
     assert main_mod.ifm.threshold == defaults["threshold"]
     assert main_mod.ifm.input_range == defaults["input_range"]
     assert main_mod.ifm.trigger_source == defaults["trigger_source"]
+    assert main_mod.ifm.reference_clock is defaults["reference_clock"]
     assert main_mod.ifm.save_enabled is False
     assert main_mod.ifm.save_file == ""
     assert main_mod.ifm.baseline_file == ""
@@ -150,6 +154,7 @@ def test_reset_applies_defaults_to_state_and_widgets(app):
     assert dpg.get_value("threshold_slider") == pytest.approx(defaults["threshold"])
     assert dpg.get_value("input_range_dropdown") == "±1V"
     assert dpg.get_value("trigger_source_dropdown") == "Channel 1"
+    assert dpg.get_value("reference_clock_checkbox") is False
     assert dpg.get_value("save_enabled_checkbox") is False
     assert dpg.get_value("save_file_input") == ""
 

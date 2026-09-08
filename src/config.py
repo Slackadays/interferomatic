@@ -61,6 +61,8 @@ VALID_EXT_TRIGGER_COUPLINGS = ("AC", "DC")
 # Allowed external-trigger ExtRange values (mV peak-to-peak).
 VALID_EXT_TRIGGER_INPUT_RANGES = (2000, 6600, 10000)
 VALID_EXT_TRIGGER_IMPEDANCES = ("50 Ohms", "High Z")
+# 10 MHz reference on the External Clock input (CS_MODE_REFERENCE_CLK).
+DEFAULT_REFERENCE_CLOCK = False
 
 # Dual-comb spectrum axis calibration (see src/spectrum.py).
 DEFAULT_DFREP_HZ = 45.84
@@ -192,6 +194,7 @@ def default_ui_settings():
         "ext_trigger_coupling": DEFAULT_EXT_TRIGGER_COUPLING,
         "ext_trigger_input_range": DEFAULT_EXT_TRIGGER_INPUT_RANGE,
         "ext_trigger_impedance": DEFAULT_EXT_TRIGGER_IMPEDANCE,
+        "reference_clock": DEFAULT_REFERENCE_CLOCK,
     }
 
 
@@ -201,7 +204,8 @@ def load_ui_settings():
     Returns a dict with keys: interferograms, threshold, save_file,
     baseline_file, save_enabled, save_format, save_when, apodization, mode,
     samplerate, input_range, bulk_limit, bulk_unit, channel1–channel4,
-    pre/post trigger samples, max_capture_rate_hz, and trigger options.
+    pre/post trigger samples, max_capture_rate_hz, trigger options,
+    and reference clock.
     """
     config = load_config()
 
@@ -337,6 +341,10 @@ def load_ui_settings():
     if ext_trigger_impedance not in VALID_EXT_TRIGGER_IMPEDANCES:
         ext_trigger_impedance = DEFAULT_EXT_TRIGGER_IMPEDANCE
 
+    reference_clock = config.get("reference_clock", DEFAULT_REFERENCE_CLOCK)
+    if not isinstance(reference_clock, bool):
+        reference_clock = DEFAULT_REFERENCE_CLOCK
+
     max_capture_rate_hz = _parse_nonneg_int(
         config.get("max_capture_rate_hz", DEFAULT_MAX_CAPTURE_RATE_HZ),
         DEFAULT_MAX_CAPTURE_RATE_HZ,
@@ -405,4 +413,5 @@ def load_ui_settings():
         "ext_trigger_coupling": ext_trigger_coupling,
         "ext_trigger_input_range": ext_trigger_input_range,
         "ext_trigger_impedance": ext_trigger_impedance,
+        "reference_clock": reference_clock,
     }

@@ -362,6 +362,16 @@ def _mode_for_channels(enabled: Sequence[int]) -> int:
     return gc.CS_MODE_QUAD
 
 
+def _acquisition_mode(enabled: Sequence[int], reference_clock: bool = False) -> int:
+    """Channel-count mode plus optional CS_MODE_REFERENCE_CLK (10 MHz)."""
+    import GageConstants as gc
+
+    mode = _mode_for_channels(enabled)
+    if reference_clock:
+        mode |= gc.CS_MODE_REFERENCE_CLK
+    return mode
+
+
 def _active_channel_indices(mode: int, channel_count: int, board_count: int) -> List[int]:
     import GageConstants as gc
     import GageSupport as gs
@@ -573,6 +583,7 @@ def _child_configure(
     trigger: Optional[Dict[str, Any]] = None,
     trigger_timeout: Optional[int] = None,
     acq_backend: Optional[GageAcq] = None,
+    reference_clock: bool = False,
 ) -> List[int]:
     import PyGage
     import GageSupport as gs
@@ -623,8 +634,12 @@ def _child_configure(
     if not isinstance(acq, dict):
         raise RuntimeError(PyGage.GetErrorString(acq))
 
-    mode = _mode_for_channels(enabled)
+    mode = _acquisition_mode(enabled, reference_clock)
     acq["Mode"] = mode
+    if reference_clock:
+        # Reference clock is not ExtClk sampling; it locks the internal
+        # oscillator to 10 MHz on the External Clock connector.
+        acq["ExtClk"] = 0
     acq["SampleRate"] = int(sample_rate)
     trigger_timeout = app_config.get("TriggerTimeout", LIVE_TRIGGER_TIMEOUT)
     try:
@@ -685,6 +700,7 @@ def _child_configure(
     app_config["PostTriggerSamples"] = post
     app_config["TriggerSource"] = int(trig_source)
     app_config["TriggerSettings"] = dict(trigger_settings)
+    app_config["ReferenceClock"] = bool(reference_clock)
     app_config["CachedAcq"] = committed
     app_config["CachedChan"] = {}
     for ch in active:
@@ -839,8 +855,10 @@ def _live_view_child_main(
     frames_since_reset = 0
     min_frame_interval_s = WORKER_MIN_FRAME_INTERVAL_S
     # Last successful configure:
-    # (rate, enabled, range_mv, pre, post, max_hz, trigger_settings, timeout).
-    last_config: Optional[Tuple[int, List[int], int, int, int, int, dict, int]] = None
+    # (rate, enabled, range_mv, pre, post, max_hz, trigger, timeout, refclk).
+    last_config: Optional[
+        Tuple[int, List[int], int, int, int, int, dict, int, bool]
+    ] = None
     wait_timeout_s: Optional[float] = CAPTURE_WAIT_TIMEOUT_S
     allow_force = True
     averager: Optional[InterferogramAverager] = None
@@ -1091,7 +1109,8 @@ def _live_view_child_main(
                 if op == "stop":
                     break
                 if op == "configure":
-                    # (op, rate, enabled, range_mv, pre, post, max_hz, trigger, timeout)
+                    # (op, rate, enabled, range_mv, pre, post, max_hz,
+                    #  trigger, timeout, reference_clock)
                     sample_rate = cmd[1]
                     enabled = cmd[2]
                     range_mv = cmd[3]
@@ -1100,6 +1119,7 @@ def _live_view_child_main(
                     max_hz_in = cmd[6] if len(cmd) > 6 else 0
                     trigger_in = cmd[7] if len(cmd) > 7 else None
                     timeout_in = cmd[8] if len(cmd) > 8 else LIVE_TRIGGER_TIMEOUT
+                    refclk_in = cmd[9] if len(cmd) > 9 else False
                     try:
                         capturing = False
                         pending_frame = None
@@ -1115,6 +1135,7 @@ def _live_view_child_main(
                             cfg_timeout = int(timeout_in)
                         except (TypeError, ValueError):
                             cfg_timeout = LIVE_TRIGGER_TIMEOUT
+                        cfg_refclk = bool(refclk_in)
                         last_config = (
                             cfg_rate,
                             cfg_enabled,
@@ -1124,6 +1145,7 @@ def _live_view_child_main(
                             max_hz,
                             dict(trig_settings),
                             cfg_timeout,
+                            cfg_refclk,
                         )
                         active_channels = _child_configure(
                             handle,
@@ -1138,6 +1160,7 @@ def _live_view_child_main(
                             trigger=last_config[6],
                             trigger_timeout=cfg_timeout,
                             acq_backend=board,
+                            reference_clock=cfg_refclk,
                         )
                         channels = list(active_channels)
                         frames_since_reset = 0
@@ -1156,6 +1179,7 @@ def _live_view_child_main(
                                     active_channels[0] if active_channels else 1,
                                 ),
                                 "trigger": dict(trig_settings),
+                                "reference_clock": cfg_refclk,
                             },
                         )
                     except Exception as e:
@@ -1419,6 +1443,7 @@ def _live_view_child_main(
                         cfg_timeout = (
                             int(rest[0]) if rest else LIVE_TRIGGER_TIMEOUT
                         )
+                        cfg_refclk = bool(rest[1]) if len(rest) > 1 else False
                         active_channels = _child_configure(
                             handle,
                             system_info,
@@ -1432,6 +1457,7 @@ def _live_view_child_main(
                             trigger=cfg_trigger,
                             trigger_timeout=cfg_timeout,
                             acq_backend=board,
+                            reference_clock=cfg_refclk,
                         )
                         min_frame_interval_s = max_capture_rate_to_interval_s(
                             int(cfg_max_hz)
@@ -1500,14 +1526,16 @@ class LiveViewEngine:
         self._configured_max_hz: Optional[int] = None
         self._configured_trigger: Optional[Tuple] = None
         self._configured_trigger_timeout: Optional[int] = None
+        self._configured_reference_clock: Optional[bool] = None
         self._running = False
         self._child_restarts = 0
         self._board_name = "Gage"
         self._last_heartbeat = 0.0
         self._board_phase = ""
-        # (rate, channels, range_mv, pre, post, max_hz, trigger_key, trigger_dict, timeout)
+        # (rate, channels, range_mv, pre, post, max_hz, trigger_key,
+        #  trigger_dict, timeout, reference_clock)
         self._pending_config: Optional[
-            Tuple[int, Tuple[int, ...], int, int, int, int, Tuple, dict, int]
+            Tuple[int, Tuple[int, ...], int, int, int, int, Tuple, dict, int, bool]
         ] = None
         self._last_error: Optional[str] = None
         self._config_ack = False
@@ -1659,6 +1687,7 @@ class LiveViewEngine:
         self._configured_max_hz = None
         self._configured_trigger = None
         self._configured_trigger_timeout = None
+        self._configured_reference_clock = None
 
     def stop(self) -> None:
         """Halt capture but keep the child (and board handle) alive."""
@@ -1726,10 +1755,16 @@ class LiveViewEngine:
                         trig = f", trigger=CH{trig_src}" if trig_src is not None else ""
                     max_hz = payload.get("max_capture_rate_hz")
                     cap = f", max_capture={max_hz} Hz" if max_hz else ""
+                    refclk = (
+                        ", refclk=10 MHz"
+                        if payload.get("reference_clock")
+                        else ""
+                    )
                     print(
                         f"Live View configured: rate={payload.get('rate')} S/s, "
                         f"range=±{(payload.get('range_mv') or 0) / 2:g} mV, "
                         f"channels={payload.get('channels')}{window}{cap}{trig}"
+                        f"{refclk}"
                     )
             elif kind == "error":
                 self._last_error = str(payload)
@@ -1798,6 +1833,7 @@ class LiveViewEngine:
                 _trig_key,
                 trig_dict,
                 trig_timeout,
+                refclk,
             ) = self._pending_config
             self._send(
                 (
@@ -1810,6 +1846,7 @@ class LiveViewEngine:
                     max_hz,
                     trig_dict,
                     trig_timeout,
+                    refclk,
                 )
             )
             # Wait for configure ack / error briefly.
@@ -1832,6 +1869,7 @@ class LiveViewEngine:
             self._configured_max_hz = max_hz
             self._configured_trigger = _trig_key
             self._configured_trigger_timeout = trig_timeout
+            self._configured_reference_clock = refclk
 
         if self._running and self._configured_channels is not None:
             self.start(
@@ -1856,6 +1894,7 @@ class LiveViewEngine:
         trigger: Optional[Dict[str, Any]] = None,
         max_capture_rate_hz: int = 0,
         trigger_timeout: Optional[int] = None,
+        reference_clock: bool = False,
     ) -> None:
         if not self._available and self._proc is None:
             raise RuntimeError("Gage system is not open")
@@ -1877,6 +1916,7 @@ class LiveViewEngine:
                 trig_timeout = int(trigger_timeout)
             except (TypeError, ValueError):
                 trig_timeout = LIVE_TRIGGER_TIMEOUT
+        refclk = bool(reference_clock)
 
         key = (
             int(sample_rate),
@@ -1888,6 +1928,7 @@ class LiveViewEngine:
             trig_key,
             dict(trig_settings),
             trig_timeout,
+            refclk,
         )
         self._pending_config = key
         if (
@@ -1899,6 +1940,7 @@ class LiveViewEngine:
             and max_hz == self._configured_max_hz
             and trig_key == self._configured_trigger
             and trig_timeout == self._configured_trigger_timeout
+            and refclk == self._configured_reference_clock
         ):
             return
 
@@ -1916,6 +1958,7 @@ class LiveViewEngine:
                 max_hz,
                 dict(trig_settings),
                 trig_timeout,
+                refclk,
             )
         )
 
@@ -1947,6 +1990,7 @@ class LiveViewEngine:
         self._configured_max_hz = max_hz
         self._configured_trigger = trig_key
         self._configured_trigger_timeout = trig_timeout
+        self._configured_reference_clock = refclk
         self._child_restarts = 0  # healthy configure resets restart budget
 
     def start(
@@ -2188,6 +2232,7 @@ class SimulatedLiveViewEngine:
         self._pre = 5000
         self._post = 15000
         self._trigger: TriggerSettings = dict(DEFAULT_TRIGGER_SETTINGS)
+        self._reference_clock = False
         self._max_capture_rate_hz = 0
         self._min_frame_interval_s = 0.0
         self._last_capture_t = 0.0
@@ -2300,6 +2345,7 @@ class SimulatedLiveViewEngine:
         trigger: Optional[Dict[str, Any]] = None,
         max_capture_rate_hz: int = 0,
         trigger_timeout: Optional[int] = None,
+        reference_clock: bool = False,
     ) -> None:
         del trigger_timeout
         enabled = sorted({int(c) for c in enabled_channels if 1 <= int(c) <= 4})
@@ -2310,6 +2356,7 @@ class SimulatedLiveViewEngine:
             pre_trigger_samples, post_trigger_samples
         )
         self._trigger = normalize_trigger_settings(trigger)
+        self._reference_clock = bool(reference_clock)
         self._max_capture_rate_hz = max(0, int(max_capture_rate_hz))
         self._min_frame_interval_s = max_capture_rate_to_interval_s(
             self._max_capture_rate_hz
@@ -2323,12 +2370,14 @@ class SimulatedLiveViewEngine:
             if self._max_capture_rate_hz
             else ""
         )
+        refclk = ", refclk=10 MHz" if self._reference_clock else ""
         print(
             f"Live View configured: rate={sample_rate} S/s, "
             f"range=±{self._configured_input_range / 2:g} mV, "
             f"channels={self._active_channels}, "
             f"window={self._pre}+{self._post} samples{cap}, "
-            f"trigger={_format_trigger_summary(self._trigger, trig_src)} "
+            f"trigger={_format_trigger_summary(self._trigger, trig_src)}"
+            f"{refclk} "
             f"(simulated)"
         )
 

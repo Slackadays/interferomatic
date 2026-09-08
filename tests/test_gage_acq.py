@@ -16,6 +16,7 @@ from src.live_view import (
     AVERAGE_TRIGGER_TIMEOUT,
     AVERAGE_WAIT_TIMEOUT_S,
     LIVE_TRIGGER_TIMEOUT,
+    _acquisition_mode,
     _mode_for_channels,
 )
 
@@ -116,6 +117,22 @@ def test_mode_is_masked_channel_count():
     assert _mode_for_channels([1]) == 1
     assert _mode_for_channels([1, 2]) == 2
     assert _mode_for_channels([1, 2, 3, 4]) == 4
+
+
+def test_reference_clock_sets_mode_bit():
+    import GageConstants as gc
+
+    assert _acquisition_mode([1], False) == gc.CS_MODE_SINGLE
+    assert _acquisition_mode([1], True) == (
+        gc.CS_MODE_SINGLE | gc.CS_MODE_REFERENCE_CLK
+    )
+    assert _acquisition_mode([1, 2], True) == (
+        gc.CS_MODE_DUAL | gc.CS_MODE_REFERENCE_CLK
+    )
+    assert (
+        _acquisition_mode([1, 2, 3, 4], True) & gc.CS_MASKED_MODE
+    ) == gc.CS_MODE_QUAD
+    assert gc.CS_MODE_REFERENCE_CLK == 0x400
 
 
 def test_average_trigger_timeout_is_finite():
