@@ -215,10 +215,10 @@ def dual_comb_period_samples(sample_rate_hz: float, d_frep_hz: float) -> int:
 def aligned_fft_length(
     n_captured: int, sample_rate_hz: float, d_frep_hz: float
 ) -> int:
-    """FFT length that puts a bin on every integer multiple of Δf_rep.
+    """FFT length that puts a bin on every integer multiple of delta f_rep.
 
-    ``N = M · round(f_s / Δf_rep)`` with ``M = ceil(n_captured / period)``.
-    Zero-padding up to *N* interpolates; it cannot recover Δf_rep structure
+    ``N = M · round(f_s / delta f_rep)`` with ``M = ceil(n_captured / period)``.
+    Zero-padding up to *N* interpolates; it cannot recover delta f_rep structure
     if the captured record is shorter than one beat period.
     """
     period = dual_comb_period_samples(sample_rate_hz, d_frep_hz)
@@ -450,7 +450,7 @@ def compute_spectrum(
     * Uses a mean-removed real FFT. Only bins with F_opt > 0 are kept.
     * ``x_at_frf0`` is the optical X coordinate for Frf = 0 (view anchor).
     * ``d_frep_hz`` aligns the FFT onto the dual-comb repetition grid
-      (``n · Δf_rep``).
+      (``n · delta f_rep``).
     """
     frf, mag, _n = compute_rf_spectrum(
         y,

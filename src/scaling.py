@@ -14,6 +14,32 @@ SCALE_PRESETS = [
 ]
 DEFAULT_FONT_SCALE = 0.50
 
+# Dear PyGui themes cannot select a typeface. These are the text inputs,
+# number inputs, and dropdowns that use the Inconsolata font registered
+# as "input_font". Buttons, checkboxes, sliders, and labels are omitted.
+INPUT_FONT_TYPES = frozenset(
+    {
+        "mvAppItemType::mvInputText",
+        "mvAppItemType::mvInputInt",
+        "mvAppItemType::mvInputFloat",
+        "mvAppItemType::mvInputDouble",
+        "mvAppItemType::mvCombo",
+    }
+)
+
+
+def bind_input_fonts():
+    """Bind the Inconsolata input font onto text inputs and dropdowns.
+
+    No-op until main() has loaded the font tagged "input_font". Safe to call
+    again after new inputs are created (for example the scale-chooser preview).
+    """
+    if not dpg.does_item_exist("input_font"):
+        return
+    for item in dpg.get_all_items():
+        if dpg.get_item_type(item) in INPUT_FONT_TYPES:
+            dpg.bind_item_font(item, "input_font")
+
 
 def load_font_scale():
     """Return a saved font scale, or None if none is configured yet."""
@@ -114,6 +140,8 @@ def show_scale_chooser(default_scale=DEFAULT_FONT_SCALE, on_done=None):
         dpg.add_slider_float(label="Sample slider", default_value=0.5, max_value=1, width=400)
         dpg.add_spacer(height=16)
         dpg.add_button(label="Continue", callback=on_continue, width=200)
+
+    bind_input_fonts()
 
     # Blocking path: only for pre-start_dearpygui startup. Never nest this
     # inside a callback while the main loop is already driving frames.

@@ -49,7 +49,7 @@ from src.config import (
     VALID_EXT_TRIGGER_COUPLINGS,
     VALID_EXT_TRIGGER_IMPEDANCES,
 )
-from src.scaling import resolve_font_scale, change_font_scale
+from src.scaling import resolve_font_scale, change_font_scale, bind_input_fonts
 from src.live_view import (
     create_live_view_engine,
     normalize_live_window,
@@ -2435,6 +2435,10 @@ def main():
         default_font = dpg.add_font("src/ScienceGothic-Medium.ttf", 80)
         giant_font = dpg.add_font("src/ScienceGothic-Medium.ttf", 240)
         small_font = dpg.add_font("src/ScienceGothic-Medium.ttf", 65)
+        # Same pixel size as the global UI font. Global font scale still applies.
+        # Themes cannot set a typeface; bind_input_fonts() attaches this font
+        # to text inputs, number inputs, and dropdowns only.
+        dpg.add_font("src/Inconsolata-Light.ttf", 60, tag="input_font")
 
     dpg.bind_font(default_font)
 
@@ -3051,7 +3055,7 @@ def main():
                                 )
 
                             dpg.add_spacer(height=8)
-                            add_settings_label("Δf_rep (Hz)", small_font)
+                            add_settings_label("delta f_rep (Hz)", small_font)
                             dpg.add_input_float(
                                 tag="d_frep_input",
                                 default_value=ifm.d_frep_hz,
@@ -3365,6 +3369,7 @@ def main():
             dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (140, 0, 0))
 
     dpg.bind_item_theme("startstop_button", "start_button_theme")
+    bind_input_fonts()
     dpg.bind_item_font("chart1", small_font)
     if dpg.does_item_exist("spectrum_plot"):
         dpg.bind_item_font("spectrum_plot", small_font)
